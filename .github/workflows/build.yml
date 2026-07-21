@@ -50,6 +50,18 @@ jobs:
           if [ -z "$f" ]; then echo "no binary"; ls -la dist || true; exit 1; fi
           cp "$f" "../${{ matrix.out }}"; chmod +x "../${{ matrix.out }}"
           echo "size: $(du -h ../${{ matrix.out }} | cut -f1)"
+      - name: Smoke test — binary must boot + import its full job chain (NEVER publish a broken build)
+        working-directory: engine
+        run: |
+          rm -f bootok
+          echo "running --verify-boot (deepened: imports sweep_runner/sweep_core/engines/hunter_hooks) on ${{ matrix.arch }} …"
+          B4L_BOOTOK_MARKER=bootok "../${{ matrix.out }}" --verify-boot || true   # self-exits; no timeout needed
+          if [ ! -f bootok ]; then
+            echo "SMOKE FAILED: --verify-boot wrote no boot-ok marker -> a job-chain import is broken"
+            echo "(the matplotlib / verify_env / missing-hidden-import class). This build is NOT published."
+            exit 1
+          fi
+          echo "smoke OK: binary boots and the full job chain imports"
       - name: Publish binary to coordinator (cloud-to-cloud) + emit hash
         working-directory: engine
         env:
