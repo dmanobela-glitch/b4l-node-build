@@ -45,6 +45,7 @@ jobs:
       - name: Locate binary
         working-directory: engine
         run: |
+          set +o pipefail   # `shell: bash` enables pipefail; `grep … | head -n1` SIGPIPEs grep -> false failure
           f=$(ls -1 dist/b4l_node* 2>/dev/null | grep -Ev '\.(zip|dist)$' | head -n1)
           if [ -z "$f" ]; then echo "no binary"; ls -la dist || true; exit 1; fi
           cp "$f" "../${{ matrix.out }}"; chmod +x "../${{ matrix.out }}"
