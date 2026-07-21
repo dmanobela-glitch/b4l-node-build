@@ -50,6 +50,36 @@ jobs:
           if [ -z "$f" ]; then echo "no binary"; ls -la dist || true; exit 1; fi
           cp "$f" "../${{ matrix.out }}"; chmod +x "../${{ matrix.out }}"
           echo "size: $(du -h ../${{ matrix.out }} | cut -f1)"
+      - name: Publish binary to coordinator (cloud-to-cloud) + emit hash
+        working-directory: engine
+        env:
+          DRAIN_TOKEN: ${{ secrets.DRAIN_TOKEN }}
+        run: |
+          set +o pipefail
+          COORD="https://compute.bull4life.com"
+          VER=$(grep -oE "VERSION = '[0-9][0-9.]*'" compute/node.py | head -1 | grep -oE "[0-9][0-9.]*" | head -1)
+          BIN="../${{ matrix.out }}"
+          SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
+          SIZE=$(wc -c < "$BIN" | tr -d ' ')
+          case "${{ matrix.arch }}" in
+            x86-64)      NAME="b4l_node-${VER}.exe"; FATAL=1 ;;   # the /version default url -> Linux fleet auto-updates
+            arm64)       NAME="b4l_node-${VER}-arm64"; FATAL=0 ;;
+            windows-x64) NAME="b4l_node-${VER}-windows.exe"; FATAL=0 ;;
+          esac
+          echo "v$VER ${{ matrix.arch }} sha ${SHA:0:16} size $((SIZE/1048576))MB -> $COORD/release/$NAME"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "X-B4L-Token: $DRAIN_TOKEN" \
+                 -H "Content-Type: application/octet-stream" --data-binary @"$BIN" "$COORD/release/$NAME")
+          echo "  upload HTTP $code"
+          if [ "$code" != "200" ] && [ "$FATAL" = "1" ]; then echo "x86 upload FAILED (fatal)"; exit 1; fi
+          mkdir -p ../meta
+          printf '%s %s %s %s\n' "$VER" "$SHA" "$SIZE" "$NAME" > "../meta/sha-${{ matrix.arch }}.txt"
+          cat "../meta/sha-${{ matrix.arch }}.txt"
+      - name: Upload hash artifact (tiny — the laptop reads this to sign, never the binary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha-${{ matrix.arch }}
+          path: meta/sha-${{ matrix.arch }}.txt
+          retention-days: 2
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.out }}
