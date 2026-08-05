@@ -1,4 +1,4 @@
-name: Build PEX one-click (tiny downloader: pex-win.zip / pex-linux.zip + runtime)
+name: Build PEX one-click tiny downloader (pex-win.zip / pex-linux.zip + runtime)
 # Model A bootstrap-launcher, TINY-DOWNLOADER refinement (Cludia 0553 / Master's design call). The shipped artifact is a
 # SMALL, STABLE shell — it does NOT bake CPython+source (that 55MB self-extractor is the #1 AV false-positive trigger and
 # got deleted on download). On first run it DOWNLOADS the runtime (/download/pex-runtime-<os>.tar.gz) + the canonical PEX
