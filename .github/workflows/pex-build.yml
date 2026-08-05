@@ -105,7 +105,11 @@ jobs:
           if [ "${{ matrix.exe }}" = "pex.exe" ]; then EXTRA="--windows-console-mode=disable"; fi
           # --standalone (folder), NOT --onefile: no self-extractor pattern, no UPX -> far fewer AV false positives.
           # runtime + source baked as single tarballs (tar preserves symlinks + exec bits).
+          # company/product/version metadata = what makes the working miner (Bull4LifeNode.exe) look like real software
+          # to AV instead of an anonymous packed binary. This is the miner's actual AV-acceptance factor — mirror it.
           python -m nuitka --standalone --assume-yes-for-downloads $EXTRA \
+            --company-name=Bull4Life --product-name=PEX \
+            --product-version=1.0.0 --file-version=1.0.0.0 \
             --include-data-file=runtime.tar.gz=runtime.tar.gz \
             --include-data-file=pexsrc.tar.gz=pexsrc.tar.gz \
             --include-data-file=pexsrc.fp=pexsrc.fp \
