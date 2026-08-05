@@ -1,30 +1,28 @@
-"""pex_launcher — the PEX one-click bootstrap (Model A, Cludia 0547 + engine 2024 crux).
+"""pex_launcher — the PEX one-click TINY DOWNLOADER (Model A, refined per Cludia 0553 / Master's design call).
 
-WHY a launcher and not a frozen onefile of the app: PEX updates itself by SWAPPING .py source and re-execing a real
-Python interpreter (node/pex_app_update_client.check_and_apply + node/pex_join_out.auto_update). A frozen Nuitka onefile
-runs baked bytecode and ignores swapped .py, and re-execs ITSELF unchanged -> a permanent update-loop-that-never-updates
-= Master's exact "I fell out of the world" bug, baked in forever. So the one-click exe is a STABLE SHELL that carries a
-real, file-based CPython + the canonical source tree + the tiny deps, materializes them into a writable per-user app dir,
-and launches `pythonw -m node.pex_join_out --gui` against that editable tree. From then on the app's OWN update client
-self-heals on every future consensus fingerprint bump WITHOUT rebuilding this exe. The launcher is rebuilt ONLY if the
-shell itself changes (rare); consensus bumps never touch it.
+WHY a tiny downloader and NOT a frozen onefile OR a 55MB baked self-extractor:
+  * A frozen onefile can't self-update (it runs baked bytecode, ignores swapped .py, re-execs itself unchanged) — that
+    was Master's original "I fell out of the world" bug. So the app must run REAL, file-based Python against EDITABLE source.
+  * A 55MB onefile that BAKES CPython + source and self-extracts them to %TEMP% then execs python is the #1 antivirus
+    heuristic ("unpack a big payload to temp + run it" = the malware tell) — it got deleted on download on Master's laptop.
+So this launcher is a SMALL, STABLE SHELL that, on first run, DOWNLOADS the CPython runtime + the canonical PEX source
+into a per-user app dir, fp-VERIFIES the source against the box's own advertised fingerprint (fork-safe, same trust model
+as auto_update — no hardcoded pin, so it stays correct as the chain moves), then launches `python -m node.pex_join_out
+--gui` against that editable tree. Benefits (all FREE, no MS submission, no cert):
+  * no baked payload + no unpack-to-temp → the biggest AV heuristic is gone; the shell is small.
+  * the shell NEVER changes (updates happen INSIDE, to the fetched source) → AV/SmartScreen reputation is earned once
+    and kept forever; consensus fp bumps self-heal via the app's own check_and_apply/auto_update, never a rebuild.
 
-This module is compiled per-OS by Nuitka onefile (NO cross-compile: pex.exe on Windows, pex-linux on Ubuntu). Three data
-payloads are baked in at build time (see .github/workflows/pex-build.yml):
-  * runtime/   -> a relocatable CPython (python-build-standalone) with cryptography + certifi (+ pywebview) preinstalled
-  * pexsrc/    -> the PEX node source tree pulled from /node_bundle, fp-gated to CANONICAL_FP at build
-  * pexsrc.fp  -> the canonical consensus fingerprint the baked tree hashes to
+Fork-safe verify: the downloaded source tree must hash (consensus_fingerprint) to the fingerprint the box advertises at
+/node_version. A tampered/mismatched bundle is REFUSED — the launcher never runs unverified source. Offline first-run
+(nothing fetched yet) fails gracefully with "offline — will fetch when online"; it's joining a live network anyway.
 
-Durability discipline (mirrors reject_non_finite_state / the point-update load-guards, now at the packaging layer):
-  * First run / missing tree -> extract the BAKED pexsrc (always valid, works with NO network).
-  * Every launch -> integrity-gate the app-dir tree: recompute consensus_fingerprint() and compare to the fp recorded
-    for the currently-materialized tree. On mismatch/corruption/poison -> try a fresh /node_bundle pull (self-heal
-    FORWARD to live), and if that's unreachable, re-extract the baked pexsrc (clean canonical). NEVER stranded on a
-    corrupt/poisoned local copy; NEVER a hard fail when offline.
-The launcher never edits the source and never touches consensus; it only bootstraps + integrity-gates + launches.
+Env overrides (used by CI self-check to point at a local http server): PEX_BUNDLE_URL, PEX_RUNTIME_URL, PEX_VERSION_URL,
+PEX_EXPECTED_FP, PEX_APP_DIR.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -36,27 +34,29 @@ import urllib.request
 from pathlib import Path
 
 BUNDLE_URL = os.environ.get("PEX_BUNDLE_URL", "https://compute.bull4life.com/node_bundle")
-APP_MODULE = "node.pex_join_out"          # THE ONE PROGRAM: boots node, pull-joins, auto-updates, opens the GUI window
+VERSION_URL = os.environ.get("PEX_VERSION_URL", "https://compute.bull4life.com/node_version")
+APP_MODULE = "node.pex_join_out"
 APP_ARGS = ["--gui"]
 FP_ONELINER = "from node.consensus_fingerprint import consensus_fingerprint; print(consensus_fingerprint())"
 
 
-# ---------------------------------------------------------------------------- payload + app dir
-def _payload_dir() -> Path:
-    """Where Nuitka onefile unpacked our baked data (runtime/, pexsrc/, pexsrc.fp). Next to this module at runtime."""
-    for cand in (getattr(sys, "_MEIPASS", None), os.path.dirname(os.path.abspath(__file__))):
-        if cand and (Path(cand) / "pexsrc.fp").exists():
-            return Path(cand)
-    # fall back to the module dir even if the marker check failed (best effort)
-    return Path(os.path.dirname(os.path.abspath(__file__)))
+def _default_runtime_url() -> str:
+    base = "https://compute.bull4life.com/download"
+    return f"{base}/pex-runtime-win.tar.gz" if os.name == "nt" else f"{base}/pex-runtime-linux.tar.gz"
 
 
+RUNTIME_URL = os.environ.get("PEX_RUNTIME_URL", _default_runtime_url())
+
+
+# ---------------------------------------------------------------------------- app dir + log
 def _app_dir() -> Path:
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+    override = os.environ.get("PEX_APP_DIR")
+    if override:
+        d = Path(override)
+    elif os.name == "nt":
+        d = Path(os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")) / "PEX"
     else:
-        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    d = Path(base) / "PEX"
+        d = Path(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")) / "PEX"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -71,65 +71,13 @@ def _log(app: Path, msg: str) -> None:
     print(line, flush=True)
 
 
-# ---------------------------------------------------------------------------- runtime python
-def _runtime_python(app: Path, *, windowless: bool = False) -> Path | None:
-    """The relocatable CPython we materialized. python-build-standalone extracts to a `python/` dir; we bake that as
-    runtime/. Windows: runtime/python.exe (+ pythonw.exe). Linux: runtime/bin/python3."""
-    if os.name == "nt":
-        names = (["pythonw.exe", "python.exe"] if windowless else ["python.exe"])
-        for n in names:
-            p = app / "runtime" / n
-            if p.exists():
-                return p
-    else:
-        p = app / "runtime" / "bin" / "python3"
-        if p.exists():
-            return p
-        p = app / "runtime" / "bin" / "python"
-        if p.exists():
-            return p
-    return None
-
-
-def _ensure_runtime(app: Path, payload: Path) -> None:
-    if _runtime_python(app) is None:
-        # the runtime is baked as ONE tar.gz (tar preserves symlinks + exec bits, which per-file data packing drops)
-        dst = app / "runtime"
-        if dst.exists():
-            shutil.rmtree(dst, ignore_errors=True)
-        dst.mkdir(parents=True, exist_ok=True)
-        _untar_to(payload / "runtime.tar.gz", dst)
-        if os.name != "nt":
-            for sub in ("bin/python3", "bin/python3.12", "bin/python"):
-                f = dst / sub
-                if f.exists() and not f.is_symlink():
-                    try:
-                        f.chmod(0o755)
-                    except Exception:
-                        pass
-
-
-# ---------------------------------------------------------------------------- source tree
-def _compute_fp(app: Path, srcdir: Path) -> str | None:
-    """Recompute the tree's consensus fingerprint with the runtime python (cwd=srcdir), the same one-liner
-    pex_self_update uses. Returns the fp string or None if the tree can't even be imported (treat as corrupt)."""
-    py = _runtime_python(app)
-    if py is None:
-        _log(app, "compute_fp: no runtime python found under app/runtime")
-        return None
-    if not (srcdir / "node" / "consensus_fingerprint.py").exists():
-        _log(app, "compute_fp: node/consensus_fingerprint.py missing in src")
-        return None
+# ---------------------------------------------------------------------------- download + tar
+def _download(url: str, timeout: float = 45.0) -> "bytes | None":
     try:
-        out = subprocess.run(
-            [str(py), "-c", FP_ONELINER], cwd=str(srcdir), capture_output=True, text=True, timeout=120
-        )
-        if out.returncode != 0 or not (out.stdout or "").strip():
-            _log(app, f"compute_fp rc={out.returncode} stderr={(out.stderr or '').strip()[:600]}")
-        fp = (out.stdout or "").strip().splitlines()[-1].strip() if (out.stdout or "").strip() else ""
-        return fp if len(fp) == 64 and all(c in "0123456789abcdef" for c in fp) else None
-    except Exception as e:
-        _log(app, f"compute_fp exception {type(e).__name__}: {e}")
+        req = urllib.request.Request(url, headers={"User-Agent": "pex-launcher/2"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except Exception:
         return None
 
 
@@ -140,19 +88,12 @@ def _tar_extractall(tar: "tarfile.TarFile", dst: Path) -> None:
         if str(p) != dstr and not str(p).startswith(dstr + os.sep):
             raise RuntimeError(f"unsafe tar member {m.name}")
     try:
-        tar.extractall(dst, filter="tar")                        # 'tar' filter preserves mode bits + symlinks
+        tar.extractall(dst, filter="tar")                        # preserves mode bits + symlinks
     except TypeError:
-        tar.extractall(dst)                                      # older Python without the filter kwarg
+        tar.extractall(dst)
 
 
-def _untar_to(tar_path: Path, dst: Path) -> None:
-    """Extract a baked .tar.gz FILE into dst (preserving symlinks + exec bits)."""
-    with tarfile.open(str(tar_path), "r:*") as tar:
-        _tar_extractall(tar, dst)
-
-
-def _extract_tar(data: bytes, dst: Path) -> None:
-    """Extract downloaded tar BYTES (the /node_bundle pull) into a fresh dst."""
+def _extract_bytes(data: bytes, dst: Path) -> None:
     if dst.exists():
         shutil.rmtree(dst, ignore_errors=True)
     dst.mkdir(parents=True, exist_ok=True)
@@ -169,76 +110,125 @@ def _extract_tar(data: bytes, dst: Path) -> None:
             pass
 
 
-def _try_download(url: str, timeout: float = 30.0) -> bytes | None:
+# ---------------------------------------------------------------------------- runtime python
+def _runtime_python(app: Path, *, windowless: bool = False) -> "Path | None":
+    if os.name == "nt":
+        for n in (["pythonw.exe", "python.exe"] if windowless else ["python.exe"]):
+            p = app / "runtime" / n
+            if p.exists():
+                return p
+    else:
+        for sub in ("bin/python3", "bin/python"):
+            p = app / "runtime" / sub
+            if p.exists():
+                return p
+    return None
+
+
+def _ensure_runtime(app: Path) -> bool:
+    if _runtime_python(app) is not None:
+        return True
+    _log(app, f"downloading runtime from {RUNTIME_URL}")
+    data = _download(RUNTIME_URL)
+    if not data:
+        _log(app, "runtime download failed (offline?)")
+        return False
+    _extract_bytes(data, app / "runtime")
+    if os.name != "nt":
+        for sub in ("bin/python3", "bin/python3.12", "bin/python"):
+            f = app / "runtime" / sub
+            if f.exists() and not f.is_symlink():
+                try:
+                    f.chmod(0o755)
+                except Exception:
+                    pass
+    return _runtime_python(app) is not None
+
+
+# ---------------------------------------------------------------------------- source tree + fp
+def _compute_fp(app: Path, srcdir: Path) -> "str | None":
+    py = _runtime_python(app)
+    if py is None:
+        _log(app, "compute_fp: no runtime python")
+        return None
+    if not (srcdir / "node" / "consensus_fingerprint.py").exists():
+        _log(app, "compute_fp: node/consensus_fingerprint.py missing")
+        return None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "pex-launcher/1"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
+        out = subprocess.run([str(py), "-c", FP_ONELINER], cwd=str(srcdir),
+                             capture_output=True, text=True, timeout=120)
+        if out.returncode != 0 or not (out.stdout or "").strip():
+            _log(app, f"compute_fp rc={out.returncode} stderr={(out.stderr or '').strip()[:600]}")
+        fp = (out.stdout or "").strip().splitlines()[-1].strip() if (out.stdout or "").strip() else ""
+        return fp if len(fp) == 64 and all(c in "0123456789abcdef" for c in fp) else None
+    except Exception as e:
+        _log(app, f"compute_fp exception {type(e).__name__}: {e}")
+        return None
+
+
+def _expected_fp(app: Path) -> "str | None":
+    env = os.environ.get("PEX_EXPECTED_FP")
+    if env and len(env.strip()) == 64:
+        return env.strip()
+    data = _download(VERSION_URL, timeout=20)
+    if not data:
+        return None
+    try:
+        fp = json.loads(data.decode("utf-8")).get("consensus_fingerprint", "")
+        return fp if len(fp) == 64 else None
     except Exception:
         return None
 
 
-def _materialize_source(app: Path, payload: Path, *, prefer_fresh: bool) -> Path:
-    """Put a valid source tree at app/src. prefer_fresh=True (corruption recovery) tries /node_bundle first to heal
-    FORWARD to live; else/offline falls back to the baked canonical pexsrc. First run uses the baked tree (offline-safe).
-    Records the resulting tree's fp in app/src.fp. Atomic swap via a temp dir."""
-    srcdir = app / "src"
+def _fetch_and_verify_source(app: Path, expected: str) -> bool:
+    """Download /node_bundle, extract to a temp tree, and adopt it ONLY if its consensus_fingerprint == expected
+    (the box's advertised fp). Fork-safe: never run unverified/mismatched source. Atomic swap into app/src."""
+    _log(app, f"downloading source from {BUNDLE_URL} (must hash to {expected[:16]}...)")
+    data = _download(BUNDLE_URL, timeout=90)
+    if not data:
+        _log(app, "source download failed (offline?)")
+        return False
     tmp = app / "src.new"
-    if tmp.exists():
+    _extract_bytes(data, tmp)
+    if not (tmp / "node" / "pex_join_out.py").exists():
+        _log(app, "downloaded bundle missing pex_join_out.py — refusing")
         shutil.rmtree(tmp, ignore_errors=True)
-
-    materialized_from = None
-    if prefer_fresh:
-        data = _try_download(BUNDLE_URL)
-        if data:
-            try:
-                _extract_tar(data, tmp)
-                if (tmp / "node" / "consensus_fingerprint.py").exists():
-                    materialized_from = "node_bundle(live)"
-            except Exception:
-                shutil.rmtree(tmp, ignore_errors=True)
-    if materialized_from is None:
-        tmp.mkdir(parents=True, exist_ok=True)
-        _untar_to(payload / "pexsrc.tar.gz", tmp)    # baked canonical (always valid, no network)
-        materialized_from = "baked(canonical)"
-
-    # atomic-ish swap
-    if srcdir.exists():
-        old = app / f"src.old.{int(time.time())}"
-        try:
-            srcdir.rename(old)
-        except Exception:
-            shutil.rmtree(srcdir, ignore_errors=True)
-            old = None
-    tmp.rename(srcdir)
-    if os.name != "nt":
-        # clear the exec bit noise; nothing in src needs it
-        pass
-    fp = _compute_fp(app, srcdir)
-    try:
-        (app / "src.fp").write_text((fp or "") + "\n", encoding="utf-8")
-    except Exception:
-        pass
-    # best-effort cleanup of any prior src.old.* (keep one for safety is unnecessary here)
-    for stale in app.glob("src.old.*"):
-        shutil.rmtree(stale, ignore_errors=True)
-    _log(app, f"materialized source from {materialized_from}; fp={(fp or 'UNKNOWN')[:16]}...")
-    return srcdir
-
-
-def _ensure_source(app: Path, payload: Path) -> Path:
+        return False
+    fp = _compute_fp(app, tmp)
+    if fp != expected:
+        _log(app, f"REFUSED: downloaded source fp {(fp or 'None')[:16]}... != advertised {expected[:16]}... (tampered/mid-publish)")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False
     srcdir = app / "src"
-    expected = ""
+    if srcdir.exists():
+        try:
+            shutil.rmtree(srcdir)
+        except Exception:
+            pass
+    tmp.rename(srcdir)
     try:
-        expected = (payload / "pexsrc.fp").read_text(encoding="utf-8").strip()
+        (app / "src.fp").write_text(fp + "\n", encoding="utf-8")
     except Exception:
         pass
+    _log(app, f"source verified + materialized; fp={fp[:16]}...")
+    return True
+
+
+def _ensure_source(app: Path) -> bool:
+    srcdir = app / "src"
+    expected = _expected_fp(app)
+    if expected is None:
+        # can't learn the target fp (offline) — only OK if we already have a verified local tree to run
+        if (srcdir / "node" / "pex_join_out.py").exists():
+            _log(app, "offline: can't reach /node_version — running last verified local tree; auto_update catches up later")
+            return True
+        _log(app, "offline first run: can't reach /node_version to learn the target fingerprint")
+        return False
 
     if not (srcdir / "node" / "pex_join_out.py").exists():
-        _log(app, "no source tree present -> extracting baked canonical (offline-safe first run)")
-        return _materialize_source(app, payload, prefer_fresh=False)
+        return _fetch_and_verify_source(app, expected)
 
-    # integrity gate: does the on-disk tree still hash to the fp we recorded for it?
+    # integrity gate on the existing tree
     recorded = ""
     try:
         recorded = (app / "src.fp").read_text(encoding="utf-8").strip()
@@ -246,26 +236,25 @@ def _ensure_source(app: Path, payload: Path) -> Path:
         pass
     cur = _compute_fp(app, srcdir)
     if cur is None:
-        _log(app, "local source tree does not import (corrupt/poisoned) -> re-materializing")
-        return _materialize_source(app, payload, prefer_fresh=True)
+        _log(app, "local tree corrupt/poisoned -> re-fetching + verifying")
+        return _fetch_and_verify_source(app, expected)
     if recorded and cur != recorded:
-        _log(app, f"local tree fp {cur[:16]}... != recorded {recorded[:16]}... (tampered/partial) -> re-materializing")
-        return _materialize_source(app, payload, prefer_fresh=True)
+        _log(app, f"local tree fp {cur[:16]}... != recorded {recorded[:16]}... (tampered) -> re-fetching")
+        return _fetch_and_verify_source(app, expected)
     if not recorded:
-        # no record yet (e.g. upgraded launcher) -> stamp it
         try:
             (app / "src.fp").write_text(cur + "\n", encoding="utf-8")
         except Exception:
             pass
-    _log(app, f"source tree OK; fp={cur[:16]}... (expected baked {expected[:16]}...) — app auto-update keeps it current")
-    return srcdir
+    _log(app, f"source OK; local fp={cur[:16]}... (box advertises {expected[:16]}...) — app auto-update keeps it current")
+    return True
 
 
 # ---------------------------------------------------------------------------- launch
 def _launch(app: Path, srcdir: Path) -> int:
     py = _runtime_python(app, windowless=True) or _runtime_python(app)
     if py is None:
-        _log(app, "FATAL: no runtime python materialized")
+        _log(app, "FATAL: no runtime python")
         return 3
     env = dict(os.environ)
     env["PEX_APP_DIR"] = str(app)
@@ -273,47 +262,64 @@ def _launch(app: Path, srcdir: Path) -> int:
     cmd = [str(py), "-m", APP_MODULE, *APP_ARGS]
     _log(app, f"launching: {' '.join(cmd)} (cwd={srcdir})")
     if os.name == "nt":
-        # hand off to the windowless python and let this shell exit — the app owns its own native window
         flags = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
         subprocess.Popen(cmd, cwd=str(srcdir), env=env, creationflags=flags, close_fds=True)
         return 0
-    # POSIX: replace the launcher process with the app
     os.chdir(str(srcdir))
     os.execve(str(py), cmd, env)
     return 0  # unreachable
 
 
+def _fatal_notify(msg: str) -> None:
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg, "PEX", 0x30)  # MB_ICONWARNING
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------- entry
 def run(selfcheck: bool = False) -> int:
     app = _app_dir()
-    payload = _payload_dir()
-    _log(app, f"pex launcher start (payload={payload}, app={app}, selfcheck={selfcheck})")
-    _ensure_runtime(app, payload)
-    srcdir = _ensure_source(app, payload)
+    _log(app, f"pex launcher start (app={app}, selfcheck={selfcheck})")
+    if not _ensure_runtime(app):
+        msg = "PEX couldn't download its runtime — check your internet connection and try again."
+        _log(app, "runtime not available")
+        if selfcheck:
+            try:
+                (app / "selfcheck.result").write_text("FAIL fp=NO_RUNTIME\n", encoding="utf-8")
+            except Exception:
+                pass
+            print("SELFCHECK FAIL fp=NO_RUNTIME")
+            return 1
+        _fatal_notify(msg)
+        return 2
+    if not _ensure_source(app):
+        msg = "PEX couldn't fetch/verify the chain source — check your connection (first run needs to be online)."
+        if selfcheck:
+            try:
+                (app / "selfcheck.result").write_text("FAIL fp=NO_SOURCE\n", encoding="utf-8")
+            except Exception:
+                pass
+            print("SELFCHECK FAIL fp=NO_SOURCE")
+            return 1
+        _fatal_notify(msg)
+        return 2
+    srcdir = app / "src"
     if selfcheck:
         fp = _compute_fp(app, srcdir)
-        expected = (payload / "pexsrc.fp").read_text(encoding="utf-8").strip()
-        ok = (fp == expected) and bool(expected)
+        expected = _expected_fp(app)
+        ok = bool(fp) and fp == expected
         verdict = "PASS" if ok else "FAIL"
         _log(app, f"SELFCHECK fp={fp} expected={expected} -> {verdict}")
         print(f"SELFCHECK {verdict} fp={fp}")
-        # a windowless (GUI-subsystem) exe can't print to the CI shell -> also drop a file the workflow reads
         try:
             (app / "selfcheck.result").write_text(f"{verdict} fp={fp}\n", encoding="utf-8")
         except Exception:
             pass
         return 0 if ok else 1
     return _launch(app, srcdir)
-
-
-def _fatal_notify(msg: str) -> None:
-    """Never fail silently on Master's #1: a windowless launcher that dies must still say so."""
-    if os.name == "nt":
-        try:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(None, msg, "PEX launcher", 0x10)  # MB_ICONERROR
-        except Exception:
-            pass
 
 
 def main() -> int:
