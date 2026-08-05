@@ -93,16 +93,16 @@ def _runtime_python(app: Path, *, windowless: bool = False) -> Path | None:
 
 def _ensure_runtime(app: Path, payload: Path) -> None:
     if _runtime_python(app) is None:
-        src = payload / "runtime"
+        # the runtime is baked as ONE tar.gz (tar preserves symlinks + exec bits, which per-file data packing drops)
         dst = app / "runtime"
         if dst.exists():
             shutil.rmtree(dst, ignore_errors=True)
-        shutil.copytree(src, dst)
-        # restore the exec bit Nuitka's data packing may drop (POSIX)
+        dst.mkdir(parents=True, exist_ok=True)
+        _untar_to(payload / "runtime.tar.gz", dst)
         if os.name != "nt":
             for sub in ("bin/python3", "bin/python3.12", "bin/python"):
                 f = dst / sub
-                if f.exists():
+                if f.exists() and not f.is_symlink():
                     try:
                         f.chmod(0o755)
                     except Exception:
@@ -114,19 +114,45 @@ def _compute_fp(app: Path, srcdir: Path) -> str | None:
     """Recompute the tree's consensus fingerprint with the runtime python (cwd=srcdir), the same one-liner
     pex_self_update uses. Returns the fp string or None if the tree can't even be imported (treat as corrupt)."""
     py = _runtime_python(app)
-    if py is None or not (srcdir / "node" / "consensus_fingerprint.py").exists():
+    if py is None:
+        _log(app, "compute_fp: no runtime python found under app/runtime")
+        return None
+    if not (srcdir / "node" / "consensus_fingerprint.py").exists():
+        _log(app, "compute_fp: node/consensus_fingerprint.py missing in src")
         return None
     try:
         out = subprocess.run(
             [str(py), "-c", FP_ONELINER], cwd=str(srcdir), capture_output=True, text=True, timeout=120
         )
-        fp = (out.stdout or "").strip().splitlines()[-1].strip() if out.stdout.strip() else ""
+        if out.returncode != 0 or not (out.stdout or "").strip():
+            _log(app, f"compute_fp rc={out.returncode} stderr={(out.stderr or '').strip()[:600]}")
+        fp = (out.stdout or "").strip().splitlines()[-1].strip() if (out.stdout or "").strip() else ""
         return fp if len(fp) == 64 and all(c in "0123456789abcdef" for c in fp) else None
-    except Exception:
+    except Exception as e:
+        _log(app, f"compute_fp exception {type(e).__name__}: {e}")
         return None
 
 
+def _tar_extractall(tar: "tarfile.TarFile", dst: Path) -> None:
+    dstr = str(dst.resolve())
+    for m in tar.getmembers():                                   # path-safe (no absolute/.. escape)
+        p = (dst / m.name).resolve()
+        if str(p) != dstr and not str(p).startswith(dstr + os.sep):
+            raise RuntimeError(f"unsafe tar member {m.name}")
+    try:
+        tar.extractall(dst, filter="tar")                        # 'tar' filter preserves mode bits + symlinks
+    except TypeError:
+        tar.extractall(dst)                                      # older Python without the filter kwarg
+
+
+def _untar_to(tar_path: Path, dst: Path) -> None:
+    """Extract a baked .tar.gz FILE into dst (preserving symlinks + exec bits)."""
+    with tarfile.open(str(tar_path), "r:*") as tar:
+        _tar_extractall(tar, dst)
+
+
 def _extract_tar(data: bytes, dst: Path) -> None:
+    """Extract downloaded tar BYTES (the /node_bundle pull) into a fresh dst."""
     if dst.exists():
         shutil.rmtree(dst, ignore_errors=True)
     dst.mkdir(parents=True, exist_ok=True)
@@ -135,12 +161,7 @@ def _extract_tar(data: bytes, dst: Path) -> None:
         tmp = tf.name
     try:
         with tarfile.open(tmp, "r:*") as tar:
-            # path-safe extract (no absolute/.. members)
-            for m in tar.getmembers():
-                p = (dst / m.name).resolve()
-                if not str(p).startswith(str(dst.resolve())):
-                    raise RuntimeError(f"unsafe tar member {m.name}")
-            tar.extractall(dst)
+            _tar_extractall(tar, dst)
     finally:
         try:
             os.unlink(tmp)
@@ -177,7 +198,8 @@ def _materialize_source(app: Path, payload: Path, *, prefer_fresh: bool) -> Path
             except Exception:
                 shutil.rmtree(tmp, ignore_errors=True)
     if materialized_from is None:
-        shutil.copytree(payload / "pexsrc", tmp)     # baked canonical (always valid, no network)
+        tmp.mkdir(parents=True, exist_ok=True)
+        _untar_to(payload / "pexsrc.tar.gz", tmp)    # baked canonical (always valid, no network)
         materialized_from = "baked(canonical)"
 
     # atomic-ish swap

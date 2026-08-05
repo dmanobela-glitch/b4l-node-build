@@ -67,6 +67,9 @@ jobs:
           # pywebview enables the native window; best-effort (Linux donors fall back to terminal/headless cleanly)
           "${{ matrix.py }}" -m pip install pywebview || echo "pywebview install skipped (GUI falls back)"
 
+      - name: Pack the runtime as one tarball (preserves symlinks + exec bits)
+        run: tar czf runtime.tar.gz -C runtime .
+
       - name: Pull canonical PEX source + FP-GATE it to the expected fingerprint
         run: |
           set -e
@@ -81,6 +84,7 @@ jobs:
             echo "FP MISMATCH — refusing to bake a non-canonical tree"; exit 1
           fi
           printf '%s\n' "$FP" > pexsrc.fp
+          tar czf pexsrc.tar.gz -C pexsrc .
         working-directory: ${{ github.workspace }}
         env:
           PYTHONPATH: ${{ github.workspace }}/pexsrc
@@ -93,9 +97,11 @@ jobs:
           set -e
           EXTRA=""
           if [ "${{ matrix.out }}" = "pex.exe" ]; then EXTRA="--windows-console-mode=disable"; fi
+          # bake runtime + source as single tarballs (tar preserves symlinks + exec bits that per-file packing drops;
+          # also packs 3 data files instead of ~3730 -> a much faster onefile)
           python -m nuitka --onefile --assume-yes-for-downloads $EXTRA \
-            --include-data-dir=runtime=runtime \
-            --include-data-dir=pexsrc=pexsrc \
+            --include-data-file=runtime.tar.gz=runtime.tar.gz \
+            --include-data-file=pexsrc.tar.gz=pexsrc.tar.gz \
             --include-data-file=pexsrc.fp=pexsrc.fp \
             --output-filename="${{ matrix.out }}" \
             launcher/pex_launcher.py
@@ -106,13 +112,20 @@ jobs:
           set -e
           rm -rf "${{ matrix.appdir }}" || true
           "./${{ matrix.out }}" --selfcheck || true         # GUI-subsystem exe: verdict goes to a file, not stdout
-          # give a windowless launch a moment, then read the result file it wrote
-          for i in 1 2 3 4 5 6 7 8 9 10; do
+          # give a windowless launch time to extract the runtime + source, then read the result file it wrote
+          for i in $(seq 1 30); do
             if [ -f "${{ matrix.appdir }}/selfcheck.result" ]; then break; fi
             sleep 3
           done
           echo "=== launcher.log ==="; cat "${{ matrix.appdir }}/launcher.log" 2>/dev/null || true
           echo "=== selfcheck.result ==="; cat "${{ matrix.appdir }}/selfcheck.result" 2>/dev/null || true
+          echo "=== PROBE: materialized runtime python ==="
+          ls -la "${{ matrix.appdir }}/runtime/bin" 2>/dev/null | head || ls -la "${{ matrix.appdir }}/runtime" 2>/dev/null | head
+          RTPY="${{ matrix.appdir }}/${{ matrix.py }}"
+          echo "runtime python: $RTPY"
+          "$RTPY" --version 2>&1 | head -3 || echo "(runtime python --version FAILED)"
+          echo "--- direct fp one-liner in src ---"
+          ( cd "${{ matrix.appdir }}/src" && "$RTPY" -c 'from node.consensus_fingerprint import consensus_fingerprint; print(consensus_fingerprint())' ) 2>&1 | head -25 || echo "(fp one-liner FAILED)"
           grep -q "^PASS fp=${{ github.event.inputs.expected_fp }}" "${{ matrix.appdir }}/selfcheck.result" \
             || { echo "SELFCHECK FAILED — artifact does not materialize the canonical tree"; exit 1; }
           echo "SELFCHECK PASS — ${{ matrix.out }} materializes ${{ github.event.inputs.expected_fp }}"
