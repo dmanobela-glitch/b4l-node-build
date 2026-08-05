@@ -1,26 +1,21 @@
-name: Build PEX one-click tiny downloader (pex-win.zip / pex-linux.zip + runtime)
-# Model A bootstrap-launcher, TINY-DOWNLOADER refinement (Cludia 0553 / Master's design call). The shipped artifact is a
-# SMALL, STABLE shell — it does NOT bake CPython+source (that 55MB self-extractor is the #1 AV false-positive trigger and
-# got deleted on download). On first run it DOWNLOADS the runtime (/download/pex-runtime-<os>.tar.gz) + the canonical PEX
-# source (/node_bundle) into %LOCALAPPDATA%\PEX, fp-VERIFIES the source against the box's advertised /node_version
-# fingerprint (fork-safe), then launches `python -m node.pex_join_out --gui`. The shell never changes -> AV/SmartScreen
-# reputation is earned once and kept; consensus fp bumps self-heal INSIDE via check_and_apply/auto_update, never a rebuild.
+name: Build PEX one-click fetch-launcher (pex-win.zip / pex-linux.zip)
+# Cludia 0561 (Model A refined to FETCH-ON-EVERY-LAUNCH). Wraps her PROVEN launcher launcher/pex_launch.py into a frozen
+# pex.exe that ships the embeddable CPython (pythonw.exe) BESIDE it. On EVERY launch the exe: GET /node_version (box fp) →
+# GET /download/pex-node.tar.gz → verify the extracted tree's consensus_fingerprint == box fp (fork-safe) → atomic-swap
+# into ~/.pex/current → exec `pythonw.exe -m node.pex_join_out` from there. So a cold start is ALWAYS current — no baked
+# staleness, no stranding across a flip, and NEVER an exe rebuild for future flips (only the tiny launcher is frozen).
 #
-# AV-friendly, all FREE (Master vetoed MS-submit + paid cert): NO UPX; --standalone folder in a .zip (not a onefile
-# self-extractor); company/product/version metadata mirrors the working miner (Bull4LifeNode.exe) so it reads as real
-# software. NO cross-compile (Cludia 0546): pex-win on Windows, pex-linux on Ubuntu. This workflow ALSO publishes the
-# per-OS runtime tarball the launcher downloads.
+# CRITICAL (Cludia's _real_python + engine 2024 crux): when frozen, sys.executable == pex.exe, so the launcher execs the
+# SIBLING pythonw.exe (embeddable python beside the exe), never itself. So pex.exe MUST be a self-contained --onefile
+# (its own python internal — no sibling python3xx.dll to clash with the embeddable one in the same folder).
+# AV-friendly (Master vetoed MS-submit + cert): NO UPX; company/product/version metadata; small launcher. NO cross-compile.
 on:
   workflow_dispatch:
     inputs:
-      expected_fp:
-        description: 'consensus_fingerprint the pulled source MUST hash to (build gate + self-check target)'
+      box_url:
+        description: 'the box the launcher fetches from at runtime'
         required: true
-        default: '9e7f2f1548091930647781e587c369887a0d4eac8a232971f7659e8ec46cd9de'
-      bundle_url:
-        description: 'canonical PEX source bundle'
-        required: true
-        default: 'https://compute.bull4life.com/node_bundle'
+        default: 'https://compute.bull4life.com'
 
 jobs:
   build:
@@ -32,22 +27,20 @@ jobs:
           - runner: ubuntu-22.04
             zip: pex-linux.zip
             exe: pex
-            runtime_out: pex-runtime-linux.tar.gz
             pbs: 'https://github.com/indygreg/python-build-standalone/releases/download/20241016/cpython-3.12.7+20241016-x86_64-unknown-linux-gnu-install_only.tar.gz'
-            py: runtime/bin/python3
+            pyx: python/bin/python3
           - runner: windows-latest
             zip: pex-win.zip
             exe: pex.exe
-            runtime_out: pex-runtime-win.tar.gz
             pbs: 'https://github.com/indygreg/python-build-standalone/releases/download/20241016/cpython-3.12.7+20241016-x86_64-pc-windows-msvc-install_only.tar.gz'
-            py: runtime/python.exe
+            pyx: python/python.exe
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     defaults:
       run:
         shell: bash
     steps:
-      - name: Checkout (launcher source)
+      - name: Checkout (has launcher/pex_launch.py — Cludia's proven launcher)
         uses: actions/checkout@v4
 
       - name: Build-python (runs Nuitka)
@@ -55,91 +48,65 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Fetch relocatable CPython (python-build-standalone) -> runtime/
+      - name: Fetch the embeddable CPython that ships BESIDE the exe
         run: |
           set -e
           curl -fsSL "${{ matrix.pbs }}" -o pbs.tar.gz
-          tar xzf pbs.tar.gz
-          mv python runtime
-          "${{ matrix.py }}" --version
+          tar xzf pbs.tar.gz            # -> ./python/
+          "${{ matrix.pyx }}" --version
 
-      - name: Vendor the tiny deps into the runtime (this runtime is HOSTED + downloaded by the launcher)
+      - name: Vendor deps into the embeddable python (runs the fetched node source)
         run: |
           set -e
-          "${{ matrix.py }}" -m pip install --upgrade pip
-          "${{ matrix.py }}" -m pip install cryptography certifi
-          "${{ matrix.py }}" -m pip install pywebview || echo "pywebview install skipped (GUI falls back)"
+          "${{ matrix.pyx }}" -m pip install --upgrade pip
+          "${{ matrix.pyx }}" -m pip install cryptography certifi
+          "${{ matrix.pyx }}" -m pip install pywebview || echo "pywebview optional (GUI falls back to terminal)"
 
-      - name: Pack the runtime tarball (preserves symlinks + exec bits)
-        run: |
-          set -e
-          tar czf runtime.tar.gz -C runtime .
-          cp runtime.tar.gz "${{ matrix.runtime_out }}"
-          ls -la "${{ matrix.runtime_out }}"
-
-      - name: Pull canonical PEX source + FP-GATE + pack bundle for the self-check
-        run: |
-          set -e
-          curl -fsSL "${{ github.event.inputs.bundle_url }}" -o bundle.tar.gz
-          mkdir pexsrc && tar xzf bundle.tar.gz -C pexsrc
-          test -f pexsrc/node/pex_join_out.py || { echo "bundle missing pex_join_out.py"; exit 1; }
-          FP=$("${{ matrix.py }}" -c 'from node.consensus_fingerprint import consensus_fingerprint; print(consensus_fingerprint())' )
-          echo "tree fp: $FP  / expected: ${{ github.event.inputs.expected_fp }}"
-          if [ "$FP" != "${{ github.event.inputs.expected_fp }}" ]; then echo "FP MISMATCH"; exit 1; fi
-          printf '%s\n' "$FP" > pexsrc.fp
-        working-directory: ${{ github.workspace }}
-        env:
-          PYTHONPATH: ${{ github.workspace }}/pexsrc
-
-      - name: Install Nuitka
+      - name: Install Nuitka (build-python)
         run: python -m pip install "nuitka" ordered-set zstandard
 
-      - name: Build the TINY launcher (Nuitka --standalone, no baked payload, no UPX, metadata)
+      - name: Freeze the launcher -> pex.exe (onefile, metadata, no UPX)
         run: |
           set -e
           EXTRA=""
           if [ "${{ matrix.exe }}" = "pex.exe" ]; then EXTRA="--windows-console-mode=disable"; fi
-          # NO --include-data-file of runtime/source -> the shell stays tiny; it DOWNLOADS them at runtime.
-          # company/product/version metadata mirrors the working miner so AV reads it as real software.
-          python -m nuitka --standalone --assume-yes-for-downloads $EXTRA \
+          python -m nuitka --onefile --assume-yes-for-downloads $EXTRA \
             --company-name=Bull4Life --product-name=PEX \
             --product-version=1.0.0 --file-version=1.0.0.0 \
             --output-filename="${{ matrix.exe }}" \
-            launcher/pex_launcher.py
-          mv pex_launcher.dist pex
-          echo "shell size:"; du -sh pex
+            launcher/pex_launch.py
+          ls -la "${{ matrix.exe }}"
 
-      - name: Self-check via a LOCAL http server (materialize + verify fp == expected, no live deps)
+      - name: Package pex/ = pex.exe + embeddable python (pythonw BESIDE the exe)
         run: |
           set -e
-          mkdir -p serve && cp runtime.tar.gz bundle.tar.gz serve/
-          python -m http.server 8799 --directory serve >/dev/null 2>&1 &
-          SRV=$!
-          sleep 3
-          export PEX_RUNTIME_URL="http://127.0.0.1:8799/runtime.tar.gz"
-          export PEX_BUNDLE_URL="http://127.0.0.1:8799/bundle.tar.gz"
-          export PEX_EXPECTED_FP="${{ github.event.inputs.expected_fp }}"
-          export PEX_APP_DIR="$PWD/selfcheck_home"
-          rm -rf "$PEX_APP_DIR"
-          "./pex/${{ matrix.exe }}" --selfcheck || true
-          for i in $(seq 1 30); do
-            if [ -f "$PEX_APP_DIR/selfcheck.result" ]; then break; fi
-            sleep 3
-          done
-          kill $SRV 2>/dev/null || true
-          echo "=== launcher.log ==="; cat "$PEX_APP_DIR/launcher.log" 2>/dev/null || true
-          echo "=== selfcheck.result ==="; cat "$PEX_APP_DIR/selfcheck.result" 2>/dev/null || true
-          grep -q "^PASS fp=${{ github.event.inputs.expected_fp }}" "$PEX_APP_DIR/selfcheck.result" \
-            || { echo "SELFCHECK FAILED"; exit 1; }
-          echo "SELFCHECK PASS — tiny launcher fetches+verifies ${{ github.event.inputs.expected_fp }}"
+          mkdir pex
+          cp "${{ matrix.exe }}" pex/
+          cp -r python/. pex/                 # python.exe/pythonw.exe/python3xx.dll/Lib -> flat beside pex.exe
+          if [ "${{ matrix.exe }}" = "pex" ]; then
+            ( cd pex && ln -sf bin/python3 python3 )   # _real_python(frozen,linux) looks for ./python3 beside the exe
+          fi
+          echo "package contents (top):"; ls pex | head
+          # sanity: the sibling interpreter the launcher will exec
+          if [ "${{ matrix.exe }}" = "pex.exe" ]; then test -f pex/pythonw.exe && echo "pythonw.exe present"; else test -e pex/python3 && echo "python3 present"; fi
 
-      - name: Zip the shell + emit .fp sidecars
+      - name: Self-check the LAUNCHER LOGIC against the live box (fetch+verify+extract, no GUI)
         run: |
           set -e
-          python -c "import shutil; shutil.make_archive('${{ matrix.zip }}'[:-4], 'zip', '.', 'pex')"
-          cp pexsrc.fp "${{ matrix.zip }}.fp"
-          cp pexsrc.fp "${{ matrix.runtime_out }}.fp"
-          ls -la "${{ matrix.zip }}" "${{ matrix.runtime_out }}"
+          # run pex_launch.fetch_current() with the EMBEDDABLE python (has deps) — proves fetch+fp-verify+atomic-extract
+          # + box reachability + fp MATCH, without exec-ing the GUI (which would hang a headless runner). The frozen
+          # end-to-end (pex.exe exec of the sibling python) is Cludia's live verify.
+          export PEX_BOX_URL="${{ github.event.inputs.box_url }}"
+          export PEX_LAUNCH_HOME="$PWD/.pexhome"
+          "${{ matrix.pyx }}" -c "import sys; sys.path.insert(0,'launcher'); import pex_launch as L; d=L.fetch_current(); import os; assert os.path.isfile(os.path.join(d,'node','pex_join_out.py')), 'no pex_join_out in fetched tree'; print('SELFCHECK FETCH+VERIFY OK ->', d)"
+          echo "--- live box fp (stamped into .fp) ---"
+          BOXFP=$("${{ matrix.pyx }}" -c "import json,urllib.request; print(json.loads(urllib.request.urlopen('${{ github.event.inputs.box_url }}/node_version',timeout=15).read()).get('consensus_fingerprint',''))")
+          echo "$BOXFP" > "${{ matrix.zip }}.fp"
+          echo "box fp: $BOXFP"
+          test -n "$BOXFP"
+
+      - name: Zip the package
+        run: python -c "import shutil; shutil.make_archive('${{ matrix.zip }}'[:-4], 'zip', '.', 'pex')"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -147,5 +114,4 @@ jobs:
           path: |
             ${{ matrix.zip }}
             ${{ matrix.zip }}.fp
-            ${{ matrix.runtime_out }}
           retention-days: 14
