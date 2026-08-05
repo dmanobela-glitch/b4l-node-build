@@ -65,23 +65,26 @@ jobs:
       - name: Install Nuitka (build-python)
         run: python -m pip install "nuitka" ordered-set zstandard
 
-      - name: Freeze the launcher -> pex.exe (onefile, metadata, no UPX)
+      - name: Freeze the launcher -> pex.exe (onefile, metadata, no UPX) into nbuild/
         run: |
           set -e
           EXTRA=""
           if [ "${{ matrix.exe }}" = "pex.exe" ]; then EXTRA="--windows-console-mode=disable"; fi
+          # entry = pex_entry.py (UTF-8/None-stdout-safe wrapper) which imports Cludia's pex_launch UNCHANGED.
+          # --output-dir keeps the binary OUT of the CWD so a linux binary named `pex` can't collide with `mkdir pex`.
           python -m nuitka --onefile --assume-yes-for-downloads $EXTRA \
             --company-name=Bull4Life --product-name=PEX \
             --product-version=1.0.0 --file-version=1.0.0.0 \
-            --output-filename="${{ matrix.exe }}" \
-            launcher/pex_launch.py
-          ls -la "${{ matrix.exe }}"
+            --include-module=pex_launch \
+            --output-dir=nbuild --output-filename="${{ matrix.exe }}" \
+            launcher/pex_entry.py
+          ls -la "nbuild/${{ matrix.exe }}"
 
       - name: Package pex/ = pex.exe + embeddable python (pythonw BESIDE the exe)
         run: |
           set -e
           mkdir pex
-          cp "${{ matrix.exe }}" pex/
+          cp "nbuild/${{ matrix.exe }}" pex/
           cp -r python/. pex/                 # python.exe/pythonw.exe/python3xx.dll/Lib -> flat beside pex.exe
           if [ "${{ matrix.exe }}" = "pex" ]; then
             ( cd pex && ln -sf bin/python3 python3 )   # _real_python(frozen,linux) looks for ./python3 beside the exe
@@ -98,6 +101,7 @@ jobs:
           # end-to-end (pex.exe exec of the sibling python) is Cludia's live verify.
           export PEX_BOX_URL="${{ github.event.inputs.box_url }}"
           export PEX_LAUNCH_HOME="$PWD/.pexhome"
+          export PYTHONUTF8=1 PYTHONIOENCODING=utf-8    # her _log prints em-dash/emoji — cp1252 would crash it
           "${{ matrix.pyx }}" -c "import sys; sys.path.insert(0,'launcher'); import pex_launch as L; d=L.fetch_current(); import os; assert os.path.isfile(os.path.join(d,'node','pex_join_out.py')), 'no pex_join_out in fetched tree'; print('SELFCHECK FETCH+VERIFY OK ->', d)"
           echo "--- live box fp (stamped into .fp) ---"
           BOXFP=$("${{ matrix.pyx }}" -c "import json,urllib.request; print(json.loads(urllib.request.urlopen('${{ github.event.inputs.box_url }}/node_version',timeout=15).read()).get('consensus_fingerprint',''))")

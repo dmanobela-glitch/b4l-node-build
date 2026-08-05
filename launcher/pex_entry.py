@@ -1,0 +1,40 @@
+"""pex_entry — thin frozen-exe entry that makes Cludia's launcher/pex_launch.py bullet-proof on Windows, WITHOUT
+changing her launcher (she leads PEX; this is the build wrapper's job).
+
+Two Windows-frozen hazards this guards, both of which would kill the app SILENTLY (the exact "app won't open" class we're
+fixing):
+  1. `pex_launch._log` prints an em-dash + ✅/⚠. Under Windows' default cp1252 stdout that raises UnicodeEncodeError.
+     → force UTF-8 (PYTHONUTF8 + reconfigure the streams).
+  2. A `--windows-console-mode=disable` (GUI-subsystem) exe has NO console, so `sys.stdout`/`sys.stderr` can be None →
+     `print()` raises AttributeError. → give them a real UTF-8 sink so every `print` is safe.
+Then hand off to her launcher unchanged.
+"""
+from __future__ import annotations
+import io
+import os
+import sys
+
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+# Ensure stdout/stderr exist and are UTF-8 (frozen windowless → None; console → cp1252).
+for _name in ("stdout", "stderr"):
+    _s = getattr(sys, _name, None)
+    if _s is None:
+        try:
+            setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
+        except Exception:
+            pass
+    else:
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")   # py3.7+; no-op-safe
+        except Exception:
+            try:
+                setattr(sys, _name, io.TextIOWrapper(_s.buffer, encoding="utf-8", errors="replace"))
+            except Exception:
+                pass
+
+import pex_launch  # noqa: E402  (her launcher, unchanged)
+
+if __name__ == "__main__":
+    pex_launch.main()
