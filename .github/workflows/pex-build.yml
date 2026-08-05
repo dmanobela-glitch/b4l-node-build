@@ -85,13 +85,19 @@ jobs:
           set -e
           mkdir pex
           cp "nbuild/${{ matrix.exe }}" pex/
-          cp -r python/. pex/                 # python.exe/pythonw.exe/python3xx.dll/Lib -> flat beside pex.exe
-          if [ "${{ matrix.exe }}" = "pex" ]; then
-            ( cd pex && ln -sf bin/python3 python3 )   # _real_python(frozen,linux) looks for ./python3 beside the exe
-          fi
+          cp -r python/. pex/                 # embeddable python flat beside the exe. Windows: pythonw.exe+python3xx.dll
+                                              # at top (resolve fine). Linux: bin/python3 (rpath $ORIGIN/../lib -> pex/lib);
+                                              # do NOT symlink a top-level python3 — zip flattens it to a broken-rpath ELF.
+                                              # Cludia's _find_python tests candidates incl bin/, so bin/python3 is used.
           echo "package contents (top):"; ls pex | head
-          # sanity: the sibling interpreter the launcher will exec
-          if [ "${{ matrix.exe }}" = "pex.exe" ]; then test -f pex/pythonw.exe && echo "pythonw.exe present"; else test -e pex/python3 && echo "python3 present"; fi
+          # HARD sanity: RUN the sibling interpreter the launcher will use — catches bug1 (frozen has no 'secrets') +
+          # bug2 (broken rpath) at BUILD time instead of on Master's machine.
+          if [ "${{ matrix.exe }}" = "pex.exe" ]; then
+            test -f pex/pythonw.exe || { echo "pythonw.exe missing"; exit 1; }
+            pex/python.exe -c "import secrets,hashlib,ssl,cryptography; print('win sibling python OK', cryptography.__version__)"
+          else
+            pex/bin/python3 -c "import secrets,hashlib,ssl,cryptography; print('linux sibling python OK', cryptography.__version__)"
+          fi
 
       - name: Self-check the LAUNCHER LOGIC against the live box (fetch+verify+extract, no GUI)
         run: |
@@ -102,7 +108,7 @@ jobs:
           export PEX_BOX_URL="${{ github.event.inputs.box_url }}"
           export PEX_LAUNCH_HOME="$PWD/.pexhome"
           export PYTHONUTF8=1 PYTHONIOENCODING=utf-8    # her _log prints em-dash/emoji — cp1252 would crash it
-          "${{ matrix.pyx }}" -c "import sys; sys.path.insert(0,'launcher'); import pex_launch as L; d=L.fetch_current(); import os; assert os.path.isfile(os.path.join(d,'node','pex_join_out.py')), 'no pex_join_out in fetched tree'; print('SELFCHECK FETCH+VERIFY OK ->', d)"
+          "${{ matrix.pyx }}" -c "import sys,os; sys.path.insert(0,'launcher'); import pex_launch as L; py=L._find_python(); d=L.fetch_current(py); assert os.path.isfile(os.path.join(d,'node','pex_join_out.py')), 'no pex_join_out in fetched tree'; print('SELFCHECK FETCH+VERIFY OK ->', d)"
           echo "--- live box fp (stamped into .fp) ---"
           BOXFP=$("${{ matrix.pyx }}" -c "import json,urllib.request; print(json.loads(urllib.request.urlopen('${{ github.event.inputs.box_url }}/node_version',timeout=15).read()).get('consensus_fingerprint',''))")
           echo "$BOXFP" > "${{ matrix.zip }}.fp"
