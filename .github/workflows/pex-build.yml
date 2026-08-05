@@ -1,13 +1,17 @@
-name: Build PEX one-click (pex.exe / pex-linux)
+name: Build PEX one-click (pex-win.zip / pex-linux.zip)
 # Model A bootstrap-launcher (Cludia 0547 + engine 2024 crux). The artifact is a STABLE SHELL that bakes a relocatable
 # CPython + the fp-gated PEX source tree + tiny deps, materializes them into a per-user app dir on first run, and launches
 # `python -m node.pex_join_out --gui` against that EDITABLE tree — so the app's own updater (check_and_apply/auto_update)
-# self-heals on every future consensus fingerprint bump WITHOUT rebuilding this exe. Rebuild ONLY if launcher/pex_launcher.py
-# changes; consensus bumps never touch it.
+# self-heals on every future consensus fingerprint bump WITHOUT rebuilding this artifact.
 #
-# THE ONE RULE (Cludia 0546): Nuitka is HOST-NATIVE — no cross-compile. pex-linux builds ON Ubuntu, pex.exe builds ON
-# Windows. Two runners, one matrix, identical source pulled from /node_bundle and fp-gated to 9e7f2f15 so the baked tree
-# provably hashes to the live consensus fingerprint. Manual (workflow_dispatch) only — fired on Master's explicit GO.
+# AV-FRIENDLY PACKAGING (Cludia 0551): ship as a Nuitka --standalone FOLDER inside a .zip, NOT a --onefile self-extractor.
+# The onefile "unpack-to-%TEMP%-then-exec" pattern + any UPX compression are the #1 antivirus false-positive triggers (it
+# deleted the first build on Master's laptop the instant it downloaded). A folder+launcher.exe in a zip trips heuristics far
+# less and survives AV that kills a bare .exe. NO UPX. Everything else identical (bootstrap-launcher, fp-gate, badge,
+# self-update, 9e7f2f15).
+#
+# THE ONE RULE (Cludia 0546): Nuitka is HOST-NATIVE — no cross-compile. pex-win builds ON Windows, pex-linux ON Ubuntu.
+# Source pulled from /node_bundle + fp-gated to 9e7f2f15 so the baked tree provably hashes to the live fingerprint.
 on:
   workflow_dispatch:
     inputs:
@@ -22,18 +26,20 @@ on:
 
 jobs:
   build:
-    name: build-${{ matrix.out }}
+    name: build-${{ matrix.zip }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-22.04            # glibc 2.35 = max donor compat; pex-linux
-            out: pex-linux
+          - runner: ubuntu-22.04            # glibc 2.35 = max donor compat
+            zip: pex-linux.zip
+            exe: pex
             pbs: 'https://github.com/indygreg/python-build-standalone/releases/download/20241016/cpython-3.12.7+20241016-x86_64-unknown-linux-gnu-install_only.tar.gz'
             py: runtime/bin/python3
             appdir: $HOME/.local/share/PEX
-          - runner: windows-latest          # pex.exe (Git Bash shell so steps are shared)
-            out: pex.exe
+          - runner: windows-latest
+            zip: pex-win.zip
+            exe: pex.exe
             pbs: 'https://github.com/indygreg/python-build-standalone/releases/download/20241016/cpython-3.12.7+20241016-x86_64-pc-windows-msvc-install_only.tar.gz'
             py: runtime/python.exe
             appdir: $LOCALAPPDATA/PEX
@@ -92,27 +98,28 @@ jobs:
       - name: Install Nuitka (build-python)
         run: python -m pip install "nuitka" ordered-set zstandard
 
-      - name: Build the launcher (Nuitka onefile, host-native)
+      - name: Build the launcher (Nuitka --standalone FOLDER, no UPX, host-native)
         run: |
           set -e
           EXTRA=""
-          if [ "${{ matrix.out }}" = "pex.exe" ]; then EXTRA="--windows-console-mode=disable"; fi
-          # bake runtime + source as single tarballs (tar preserves symlinks + exec bits that per-file packing drops;
-          # also packs 3 data files instead of ~3730 -> a much faster onefile)
-          python -m nuitka --onefile --assume-yes-for-downloads $EXTRA \
+          if [ "${{ matrix.exe }}" = "pex.exe" ]; then EXTRA="--windows-console-mode=disable"; fi
+          # --standalone (folder), NOT --onefile: no self-extractor pattern, no UPX -> far fewer AV false positives.
+          # runtime + source baked as single tarballs (tar preserves symlinks + exec bits).
+          python -m nuitka --standalone --assume-yes-for-downloads $EXTRA \
             --include-data-file=runtime.tar.gz=runtime.tar.gz \
             --include-data-file=pexsrc.tar.gz=pexsrc.tar.gz \
             --include-data-file=pexsrc.fp=pexsrc.fp \
-            --output-filename="${{ matrix.out }}" \
+            --output-filename="${{ matrix.exe }}" \
             launcher/pex_launcher.py
-          ls -la "${{ matrix.out }}"
+          # tidy folder name the user sees after unzip: pex/
+          mv pex_launcher.dist pex
+          ls -la "pex/${{ matrix.exe }}"
 
       - name: Self-check the artifact (materialize + verify fp == expected)
         run: |
           set -e
           rm -rf "${{ matrix.appdir }}" || true
-          "./${{ matrix.out }}" --selfcheck || true         # GUI-subsystem exe: verdict goes to a file, not stdout
-          # give a windowless launch time to extract the runtime + source, then read the result file it wrote
+          "./pex/${{ matrix.exe }}" --selfcheck || true     # GUI-subsystem exe: verdict goes to a file, not stdout
           for i in $(seq 1 30); do
             if [ -f "${{ matrix.appdir }}/selfcheck.result" ]; then break; fi
             sleep 3
@@ -120,23 +127,23 @@ jobs:
           echo "=== launcher.log ==="; cat "${{ matrix.appdir }}/launcher.log" 2>/dev/null || true
           echo "=== selfcheck.result ==="; cat "${{ matrix.appdir }}/selfcheck.result" 2>/dev/null || true
           echo "=== PROBE: materialized runtime python ==="
-          ls -la "${{ matrix.appdir }}/runtime/bin" 2>/dev/null | head || ls -la "${{ matrix.appdir }}/runtime" 2>/dev/null | head
           RTPY="${{ matrix.appdir }}/${{ matrix.py }}"
-          echo "runtime python: $RTPY"
           "$RTPY" --version 2>&1 | head -3 || echo "(runtime python --version FAILED)"
-          echo "--- direct fp one-liner in src ---"
-          ( cd "${{ matrix.appdir }}/src" && "$RTPY" -c 'from node.consensus_fingerprint import consensus_fingerprint; print(consensus_fingerprint())' ) 2>&1 | head -25 || echo "(fp one-liner FAILED)"
           grep -q "^PASS fp=${{ github.event.inputs.expected_fp }}" "${{ matrix.appdir }}/selfcheck.result" \
             || { echo "SELFCHECK FAILED — artifact does not materialize the canonical tree"; exit 1; }
-          echo "SELFCHECK PASS — ${{ matrix.out }} materializes ${{ github.event.inputs.expected_fp }}"
+          echo "SELFCHECK PASS — pex/${{ matrix.exe }} materializes ${{ github.event.inputs.expected_fp }}"
 
-      - name: Emit .fp sidecar
-        run: cp pexsrc.fp "${{ matrix.out }}.fp"
+      - name: Zip the folder + emit .fp sidecar
+        run: |
+          set -e
+          python -c "import shutil; shutil.make_archive('${{ matrix.zip }}'[:-4], 'zip', '.', 'pex')"
+          cp pexsrc.fp "${{ matrix.zip }}.fp"
+          ls -la "${{ matrix.zip }}" "${{ matrix.zip }}.fp"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.out }}
+          name: ${{ matrix.zip }}
           path: |
-            ${{ matrix.out }}
-            ${{ matrix.out }}.fp
+            ${{ matrix.zip }}
+            ${{ matrix.zip }}.fp
           retention-days: 14
