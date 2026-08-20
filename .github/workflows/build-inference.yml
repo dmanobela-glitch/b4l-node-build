@@ -1,56 +1,64 @@
 name: Build inference (7B Army - Slice 1 smoke)
 # 7B-Army fleet inference, Slice 1: prove the RUNTIME works on a Linux runner.
-# Build llama.cpp from source (CPU) + smoke-test with a SMALL coder model (1.5B) so a 2-core/7GB runner
-# won't OOM. (The full 7B ships to capable nodes later; system-detect picks the model per hardware.)
-# actions/cache the GGUF. CPU-only, no laptop, no secrets, public model + public llama.cpp only.
+# Prebuilt llama.cpp (fast) + validated small GGUF + a hard-timeout non-interactive smoke with diagnostics.
+# CPU-only, no laptop, no secrets, public model + public llama.cpp only.
 on:
   workflow_dispatch:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     env:
       MODEL_REPO: Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF
       MODEL_FILE: qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Cache model GGUF
         id: modelcache
         uses: actions/cache@v4
         with:
           path: models
-          key: gguf-${{ env.MODEL_FILE }}
-      - name: Download model (only on cache miss)
-        if: steps.modelcache.outputs.cache-hit != 'true'
+          key: gguf-${{ env.MODEL_FILE }}-v2
+      - name: Download + VALIDATE model
         run: |
           set -e
           mkdir -p models
-          echo "cache MISS - downloading $MODEL_FILE (~1GB) from HuggingFace..."
-          curl -L --fail --retry 5 --retry-delay 5 -C - -o "models/$MODEL_FILE" \
-            "https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_FILE?download=true"
-      - name: Verify model present
-        run: ls -la models/ && du -h "models/$MODEL_FILE"
-      - name: Build llama.cpp from source (CPU)
+          if [ ! -s "models/$MODEL_FILE" ]; then
+            echo "downloading $MODEL_FILE ..."
+            curl -L --fail --retry 5 -o "models/$MODEL_FILE" \
+              "https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_FILE?download=true"
+          fi
+          SZ=$(stat -c%s "models/$MODEL_FILE")
+          MAGIC=$(head -c 4 "models/$MODEL_FILE")
+          echo "size=$SZ bytes  magic=$MAGIC"
+          [ "$SZ" -gt 500000000 ] || { echo "FAIL: model too small ($SZ) - bad download"; head -c 300 "models/$MODEL_FILE"; exit 1; }
+          [ "$MAGIC" = "GGUF" ] || { echo "FAIL: not a GGUF file (magic=$MAGIC)"; exit 1; }
+          echo "model OK: valid GGUF, $SZ bytes"
+      - name: Fetch prebuilt llama.cpp (CPU)
         run: |
           set -e
-          sudo apt-get update -qq && sudo apt-get install -y -qq cmake build-essential
-          git clone --depth 1 https://github.com/ggml-org/llama.cpp
-          cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
-          cmake --build llama.cpp/build -j"$(nproc)" --target llama-cli
-          CLI=$(find llama.cpp/build -name 'llama-cli' -type f | head -1)
-          test -n "$CLI" || { echo "FAIL: llama-cli not built"; find llama.cpp/build -name 'llama*' -type f; exit 1; }
-          echo "built: $CLI"; echo "LLAMA_CLI=$CLI" >> $GITHUB_ENV
+          gh release download --repo ggml-org/llama.cpp --pattern '*bin-ubuntu-x64*.zip' --dir dl \
+            || gh release download --repo ggml-org/llama.cpp --pattern '*ubuntu*x64*.zip' --dir dl
+          ls -la dl/
+          unzip -o -q dl/*.zip -d llama
+          CLI=$(find llama -name 'llama-cli' -type f | head -1)
+          test -n "$CLI" || { echo "FAIL: no llama-cli in release"; find llama -type f | head -20; exit 1; }
+          chmod +x "$CLI"
+          echo "LLAMA_CLI=$CLI" >> $GITHUB_ENV
+          echo "LLAMA_DIR=$(dirname "$CLI")" >> $GITHUB_ENV
       - name: SMOKE - model loads + returns tokens
-        timeout-minutes: 6
+        timeout-minutes: 5
         run: |
-          set -e
-          echo "=== running inference (coder prompt, small model, non-interactive) ==="
-          "$LLAMA_CLI" -m "models/$MODEL_FILE" \
+          set +e
+          export LD_LIBRARY_PATH="$LLAMA_DIR:$LD_LIBRARY_PATH"
+          echo "=== llama-cli version ==="; "$LLAMA_CLI" --version 2>&1 | head -3
+          echo "=== running one-shot inference (hard 120s cap) ==="
+          timeout 120 "$LLAMA_CLI" -m "models/$MODEL_FILE" \
             -p "Write a one-line Python function that returns the square of n." \
-            -n 32 -c 512 -t 2 -no-cnv --no-display-prompt --no-warmup < /dev/null > out.txt 2> err.log || {
-              echo "run exited nonzero; err tail:"; tail -25 err.log; }
-          echo "--- output ---"; cat out.txt; echo "--------------"
-          if [ -z "$(tr -d '[:space:]' < out.txt)" ]; then
-            echo "FAIL: empty output"; echo "err tail:"; tail -25 err.log; exit 1; fi
-          echo ""
-          echo "PASS: llama.cpp loaded a coder model and returned tokens on a CPU Linux runner."
-          echo "7B-Army Slice 1 runtime PROVEN. (Full 7B deploys to capable nodes; system-detect picks per-hardware.)"
+            -n 32 -c 512 -t 2 -no-cnv --no-display-prompt < /dev/null > out.txt 2> err.log
+          RC=$?
+          echo "exit=$RC"
+          echo "--- stdout ---"; cat out.txt; echo "--- stderr tail ---"; tail -15 err.log; echo "--------------"
+          if [ "$RC" = "124" ]; then echo "FAIL: inference hung (120s timeout) - flag/model issue"; exit 1; fi
+          if [ -z "$(tr -d '[:space:]' < out.txt)" ]; then echo "FAIL: empty output (rc=$RC)"; exit 1; fi
+          echo "PASS: llama.cpp loaded a coder model and returned tokens on a CPU Linux runner. Slice 1 runtime PROVEN."
