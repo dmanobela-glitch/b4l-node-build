@@ -37,10 +37,9 @@ jobs:
       - name: Fetch prebuilt llama.cpp (CPU)
         run: |
           set -e
-          gh release download --repo ggml-org/llama.cpp --pattern '*bin-ubuntu-x64*.zip' --dir dl \
-            || gh release download --repo ggml-org/llama.cpp --pattern '*ubuntu*x64*.zip' --dir dl
+          gh release download --repo ggml-org/llama.cpp --pattern 'llama-*-bin-ubuntu-x64.tar.gz' --dir dl
           ls -la dl/
-          unzip -o -q dl/*.zip -d llama
+          mkdir -p llama && tar -xzf dl/*.tar.gz -C llama
           CLI=$(find llama -name 'llama-cli' -type f | head -1)
           test -n "$CLI" || { echo "FAIL: no llama-cli in release"; find llama -type f | head -20; exit 1; }
           chmod +x "$CLI"
