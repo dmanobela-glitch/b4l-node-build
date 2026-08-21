@@ -1,0 +1,100 @@
+name: Bench quality probe (13-14B vs 7B on edge-case code - Master GO 2026-08-21)
+# Second phase of the 13-14B flagship decision: the main bench (bench-14b.yml, run 32531673633) runs the
+# G20 8-prompt set for direct speed/quality parity. THIS probe answers Master's "GOOD LOGIC and GOOD CODE":
+# 10 HARDER code prompts (iterative fib, order-preserving dedup, palindrome w/ case+alnum, two-sum,
+# balanced brackets, byte formatting, CSV-with-quotes parsing, top-k, IPv4 validator, fizzbuzz) that
+# expose the subtle bugs/edge-case misses of a weak coder. SAME harness, SAME runner class, SAME llama.cpp
+# b10545, SAME -st one-shot. qwen7b leg = same-run baseline so the harder-set comparison is apples-to-apples.
+# Verdict: compile count + exact/norm + engine review of the generated code (bench-details.jsonl artifacts).
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: qwen14b
+            MODEL_REPO: Qwen/Qwen2.5-Coder-14B-Instruct-GGUF
+            MODEL_FILE: qwen2.5-coder-14b-instruct-q4_k_m.gguf
+            MODEL_SHA256: c1e659736d89ac1065fb495330fb824d94001974a4bfa78e7270e43476a8d940
+            MODEL_SIZE: 8988110272
+          - name: qwen7b
+            MODEL_REPO: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+            MODEL_FILE: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+            MODEL_SHA256: 509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c
+            MODEL_SIZE: 4683073536
+    env:
+      MODEL_REPO: ${{ matrix.MODEL_REPO }}
+      MODEL_FILE: ${{ matrix.MODEL_FILE }}
+      MODEL_SHA256: ${{ matrix.MODEL_SHA256 }}
+      MODEL_SIZE: ${{ matrix.MODEL_SIZE }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Cache model GGUF (download once per model, restore fast)
+        id: modelcache
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: gguf-${{ matrix.name }}-v1
+      - name: Download + sha256-VALIDATE model
+        run: |
+          set -e
+          mkdir -p models
+          if [ ! -s "models/$MODEL_FILE" ]; then
+            curl -L --fail --retry 5 -o "models/$MODEL_FILE" \
+              "https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_FILE?download=true"
+          fi
+          SZ=$(stat -c%s "models/$MODEL_FILE")
+          MAGIC=$(head -c 4 "models/$MODEL_FILE")
+          echo "size=$SZ  magic=$MAGIC  cache_hit=${{ steps.modelcache.outputs.cache-hit }}"
+          [ "$SZ" -ge $MODEL_SIZE ] || { echo "FAIL: model too small ($SZ)"; exit 1; }
+          [ "$MAGIC" = "GGUF" ] || { echo "FAIL: not a GGUF (magic=$MAGIC)"; exit 1; }
+          ACTUAL=$(sha256sum "models/$MODEL_FILE" | cut -d' ' -f1)
+          echo "sha256=$ACTUAL"
+          [ "$ACTUAL" = "$MODEL_SHA256" ] || { echo "FAIL: sha256 mismatch (expected $MODEL_SHA256)"; exit 1; }
+          echo "model OK: valid GGUF, $SZ bytes, sha256 verified"
+      - name: Fetch prebuilt llama.cpp (CPU, pin b10545 - 'latest' has no binary assets)
+        run: |
+          set -e
+          gh release download b10545 --repo ggml-org/llama.cpp --pattern 'llama-*-bin-ubuntu-x64.tar.gz' --dir dl
+          mkdir -p llama && tar -xzf dl/*.tar.gz -C llama
+          CLI=$(find llama -name 'llama-cli' -type f | head -1)
+          test -n "$CLI" || { echo "FAIL: no llama-cli in release"; exit 1; }
+          chmod +x "$CLI"
+          echo "LLAMA_CLI=$CLI" >> $GITHUB_ENV
+          echo "LLAMA_DIR=$(dirname "$CLI")" >> $GITHUB_ENV
+      - name: Fetch Slice-6 harness + edge-case prompts (public, pure stdlib)
+        run: |
+          set -e
+          curl -L --fail --retry 5 -o bench_inference.py \
+            "https://raw.githubusercontent.com/dmanobela-glitch/b4l-node-build/main/tools/bench_inference.py"
+          curl -L --fail --retry 5 -o quality-prompts.json \
+            "https://raw.githubusercontent.com/dmanobela-glitch/b4l-node-build/main/tools/quality-prompts.json"
+          python3 -c "import ast; ast.parse(open('bench_inference.py').read()); print('harness parses OK')"
+          python3 bench_inference.py --selftest
+      - name: Run edge-case probe (one-shot -st, ctx 2048, 10 hard prompts, n=256)
+        timeout-minutes: 45
+        run: |
+          set +e
+          export LD_LIBRARY_PATH="$LLAMA_DIR:$LD_LIBRARY_PATH"
+          echo "=== runner RAM ==="; free -m; nproc
+          timeout -k 60 2400 python3 bench_inference.py --bench \
+            --bin "$LLAMA_CLI" --model "models/$MODEL_FILE" \
+            --prompts quality-prompts.json \
+            --max-tokens 256 --temp 0.0 --timeout 240 --out "benchout-${{ matrix.name }}"
+          RC=$?
+          echo "harness_rc=$RC"
+          ls -la "benchout-${{ matrix.name }}" 2>/dev/null || true
+          cat "benchout-${{ matrix.name }}/bench-summary.json" 2>/dev/null || echo "NO SUMMARY"
+          if [ "$RC" != "0" ]; then echo "FAIL: harness exited $RC"; exit 1; fi
+          echo "PASS: ${{ matrix.name }} quality probe complete"
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qprobe-${{ matrix.name }}
+          path: benchout-${{ matrix.name }}/
+          if-no-files-found: error
