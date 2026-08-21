@@ -1,0 +1,99 @@
+name: Bench models (Slice 6 - Ornith-9B vs 7B quality-tier decision)
+# 7B-Army Slice 6: benchmark the QUALITY-tier candidate (Ornith-1.0-9B-MTP-graft Q4_K_M, 5.78GB)
+# against the BASE tier (Qwen2.5-Coder-7B-Instruct Q4_K_M, 4.68GB) on the SAME runner class, using
+# the Slice-6 harness (bench_inference.py) with the production one-shot invocation (-st).
+# Output: bench-summary.json + bench-details.jsonl artifacts per model -> decides whether Ornith
+# gets promoted via the Slice-5 B4L_INFER_MODEL_* pin. CPU-only, no secrets, public models.
+# Matrix over both models so a single dispatch answers the question on identical hardware.
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: qwen7b
+            MODEL_REPO: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+            MODEL_FILE: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+            MODEL_SHA256: 509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c
+            MODEL_SIZE: 4683073536
+          - name: ornith9b
+            MODEL_REPO: giaki3003/Ornith-1.0-9B-MTP-GGUF
+            MODEL_FILE: Ornith-1.0-9B-MTP-graft-Q4_K_M.gguf
+            MODEL_SHA256: 440464ac051daf4851e07130ad064a598b7da0180c51bee3b4a2835817580d77
+            MODEL_SIZE: 5780090144
+    env:
+      MODEL_REPO: ${{ matrix.MODEL_REPO }}
+      MODEL_FILE: ${{ matrix.MODEL_FILE }}
+      MODEL_SHA256: ${{ matrix.MODEL_SHA256 }}
+      MODEL_SIZE: ${{ matrix.MODEL_SIZE }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Cache model GGUF (download once per model, restore fast)
+        id: modelcache
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: gguf-${{ matrix.name }}-v1
+      - name: Download + sha256-VALIDATE model
+        run: |
+          set -e
+          mkdir -p models
+          if [ ! -s "models/$MODEL_FILE" ]; then
+            echo "downloading $MODEL_FILE ($MODEL_SIZE bytes) ..."
+            curl -L --fail --retry 5 -o "models/$MODEL_FILE" \
+              "https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_FILE?download=true"
+          fi
+          SZ=$(stat -c%s "models/$MODEL_FILE")
+          MAGIC=$(head -c 4 "models/$MODEL_FILE")
+          echo "size=$SZ  magic=$MAGIC  cache_hit=${{ steps.modelcache.outputs.cache-hit }}"
+          [ "$SZ" -ge $MODEL_SIZE ] || { echo "FAIL: model too small ($SZ)"; exit 1; }
+          [ "$MAGIC" = "GGUF" ] || { echo "FAIL: not a GGUF (magic=$MAGIC)"; exit 1; }
+          ACTUAL=$(sha256sum "models/$MODEL_FILE" | cut -d' ' -f1)
+          echo "sha256=$ACTUAL"
+          [ "$ACTUAL" = "$MODEL_SHA256" ] || { echo "FAIL: sha256 mismatch (expected $MODEL_SHA256)"; exit 1; }
+          echo "model OK: valid GGUF, $SZ bytes, sha256 verified"
+      - name: Fetch prebuilt llama.cpp (CPU)
+        run: |
+          set -e
+          gh release download --repo ggml-org/llama.cpp --pattern 'llama-*-bin-ubuntu-x64.tar.gz' --dir dl
+          mkdir -p llama && tar -xzf dl/*.tar.gz -C llama
+          CLI=$(find llama -name 'llama-cli' -type f | head -1)
+          test -n "$CLI" || { echo "FAIL: no llama-cli in release"; exit 1; }
+          chmod +x "$CLI"
+          echo "LLAMA_CLI=$CLI" >> $GITHUB_ENV
+          echo "LLAMA_DIR=$(dirname "$CLI")" >> $GITHUB_ENV
+      - name: Fetch Slice-6 harness (public, pure stdlib)
+        run: |
+          set -e
+          curl -L --fail --retry 5 -o bench_inference.py \
+            "https://raw.githubusercontent.com/dmanobela-glitch/b4l-node-build/main/tools/bench_inference.py"
+          python3 -c "import ast; ast.parse(open('bench_inference.py').read()); print('harness parses OK')"
+          python3 bench_inference.py --selftest
+      - name: Run Slice-6 harness (one-shot -st, ctx 2048, per-prompt timeout)
+        timeout-minutes: 30
+        run: |
+          set +e
+          export LD_LIBRARY_PATH="$LLAMA_DIR:$LD_LIBRARY_PATH"
+          echo "=== runner RAM ==="; free -m
+          # The harness reports HONEST rc=124 timeouts; the outer timeout -k escalates a
+          # SIGTERM-ignoring llama-cli to SIGKILL so one stalled prompt cannot eat the step cap.
+          timeout -k 60 1500 python3 bench_inference.py --bench \
+            --bin "$LLAMA_CLI" --model "models/$MODEL_FILE" \
+            --max-tokens 128 --temp 0.0 --timeout 120 --out "benchout-${{ matrix.name }}"
+          RC=$?
+          echo "harness_rc=$RC"
+          ls -la "benchout-${{ matrix.name }}" 2>/dev/null || true
+          cat "benchout-${{ matrix.name }}/bench-summary.json" 2>/dev/null || echo "NO SUMMARY"
+          if [ "$RC" != "0" ]; then echo "FAIL: harness exited $RC"; exit 1; fi
+          echo "PASS: ${{ matrix.name }} benchmark complete"
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.name }}
+          path: benchout-${{ matrix.name }}/
+          if-no-files-found: error
