@@ -60,7 +60,10 @@ jobs:
       - name: Fetch prebuilt llama.cpp (CPU)
         run: |
           set -e
-          gh release download --repo ggml-org/llama.cpp --pattern 'llama-*-bin-ubuntu-x64.tar.gz' --dir dl
+          # Pin a b-numbered release: llama.cpp's semver "latest" (v0.2.0) carries no binary
+          # assets (only nightly-tag.txt), so an unpinned pattern download fails. b10545 is the
+          # proven runtime (Slice-1 smoke, one-shot -st invocation).
+          gh release download --repo ggml-org/llama.cpp --tag b10545 --pattern 'llama-*-bin-ubuntu-x64.tar.gz' --dir dl
           mkdir -p llama && tar -xzf dl/*.tar.gz -C llama
           CLI=$(find llama -name 'llama-cli' -type f | head -1)
           test -n "$CLI" || { echo "FAIL: no llama-cli in release"; exit 1; }
