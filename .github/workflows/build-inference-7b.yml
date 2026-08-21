@@ -1,0 +1,74 @@
+name: Build inference 7B (production model smoke)
+# 7B-Army Slice 1b: prove the PRODUCTION model (Qwen2.5-Coder-7B-Instruct Q4_K_M, 4.68GB) loads and
+# runs ONE-SHOT on a real Linux GitHub runner with the exact invocation the Slice-2b worker uses.
+# Also validates actions/cache for the 4.68GB GGUF (the model-distribution mechanism) + the worker's
+# OOM-guard assumption (free RAM check before load). CPU-only, no laptop, no secrets, public model.
+on:
+  workflow_dispatch:
+jobs:
+  smoke7b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      MODEL_REPO: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+      MODEL_FILE: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+      MODEL_SHA256: 509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Cache model GGUF (4.68GB — download once, restore fast)
+        id: modelcache
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: gguf-${{ env.MODEL_FILE }}-v3
+      - name: Download + sha256-VALIDATE model
+        run: |
+          set -e
+          mkdir -p models
+          if [ ! -s "models/$MODEL_FILE" ]; then
+            echo "downloading $MODEL_FILE (4.68GB) ..."
+            curl -L --fail --retry 5 -o "models/$MODEL_FILE" \
+              "https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_FILE?download=true"
+          fi
+          SZ=$(stat -c%s "models/$MODEL_FILE")
+          MAGIC=$(head -c 4 "models/$MODEL_FILE")
+          echo "size=$SZ bytes  magic=$MAGIC  cache_hit=${{ steps.modelcache.outputs.cache-hit }}"
+          [ "$SZ" -gt 4000000000 ] || { echo "FAIL: model too small ($SZ) - bad download"; exit 1; }
+          [ "$MAGIC" = "GGUF" ] || { echo "FAIL: not a GGUF (magic=$MAGIC)"; exit 1; }
+          ACTUAL=$(sha256sum "models/$MODEL_FILE" | cut -d' ' -f1)
+          echo "sha256=$ACTUAL"
+          [ "$ACTUAL" = "$MODEL_SHA256" ] || { echo "FAIL: sha256 mismatch (expected $MODEL_SHA256)"; exit 1; }
+          echo "model OK: valid GGUF, $SZ bytes, sha256 verified"
+      - name: Fetch prebuilt llama.cpp (CPU)
+        run: |
+          set -e
+          gh release download --repo ggml-org/llama.cpp --pattern 'llama-*-bin-ubuntu-x64.tar.gz' --dir dl
+          mkdir -p llama && tar -xzf dl/*.tar.gz -C llama
+          CLI=$(find llama -name 'llama-cli' -type f | head -1)
+          test -n "$CLI" || { echo "FAIL: no llama-cli in release"; exit 1; }
+          chmod +x "$CLI"
+          echo "LLAMA_CLI=$CLI" >> $GITHUB_ENV
+          echo "LLAMA_DIR=$(dirname "$CLI")" >> $GITHUB_ENV
+      - name: SMOKE - production model one-shot (worker invocation shape, OOM-guard precheck)
+        timeout-minutes: 8
+        run: |
+          set +e
+          export LD_LIBRARY_PATH="$LLAMA_DIR:$LD_LIBRARY_PATH"
+          echo "=== runner RAM (worker OOM-guard precheck: ctx 2048 needs >= 6GB free) ==="
+          free -m
+          AVAIL_MB=$(free -m | awk '/^Mem:/{print $7}')
+          echo "avail_mb=$AVAIL_MB"
+          if [ "$AVAIL_MB" -lt 6000 ]; then echo "WARN: <6GB available - 7B Q4_K_M is tight on this runner (ctx 2048)"; fi
+          echo "=== one-shot inference: -st + -n cap + /dev/null stdin (Slice-2b worker shape, ctx 2048) ==="
+          /usr/bin/time -v timeout -k 30 240 "$LLAMA_CLI" -m "models/$MODEL_FILE" \
+            -p "write a python function that returns the nth fibonacci number" -n 32 -t 2 -c 2048 \
+            --temp 0.2 -st --no-display-prompt < /dev/null > out.txt 2> time.txt
+          RC=$?
+          echo "exit_code=$RC"
+          echo "=== generated tokens (first 400 chars) ==="; head -c 400 out.txt; echo
+          echo "=== resource usage ==="; grep -E "Elapsed|Maximum resident|User time|System time" time.txt || true
+          if [ "$RC" = "124" ]; then echo "FAIL: hung - invocation still interactive/blocking"; exit 1; fi
+          if [ "$RC" != "0" ]; then echo "FAIL: llama-cli exited $RC"; tail -20 time.txt; exit 1; fi
+          OUT_LEN=$(wc -c < out.txt)
+          [ "$OUT_LEN" -gt 10 ] || { echo "FAIL: no generated text (stdout $OUT_LEN bytes)"; exit 1; }
+          echo "PASS: PRODUCTION 7B Q4_K_M loaded + ran one-shot on a real runner (clean exit 0, $OUT_LEN bytes out)"
