@@ -106,13 +106,17 @@ jobs:
           # Portable across windows/mac/linux (GNU `timeout` does not exist on mac/windows-bash): run the
           # binary in the background, poll for the marker, hard-cap at 300s, and CAPTURE its output so a
           # real boot/import failure is visible in the log instead of being swallowed by `|| true`.
-          rm -f bootok verify_boot.log
+          rm -f "$PWD/bootok" verify_boot.log
           echo "running --verify-boot (imports engine_web/credit_chain/b4l_chain/accounts/bot_*/fund + the frozen self-dispatch targets node/brain/chain) on ${{ matrix.arch }} …"
-          B4L_BOOTOK_MARKER=bootok "$FOUND_BIN" --verify-boot >verify_boot.log 2>&1 &
+          # ABSOLUTE marker path: strategy_plan.py does os.chdir(ROOT) at module scope and _verify_boot
+          # imports it BEFORE writing the marker, so a RELATIVE marker (bootok) lands in the chdir'd ROOT
+          # (onefile temp extraction dir) and the smoke never sees it -> false SMOKE FAILED with an empty
+          # log (process exits 0, no output). The marker path must survive the chdir.
+          B4L_BOOTOK_MARKER="$PWD/bootok" "$FOUND_BIN" --verify-boot >verify_boot.log 2>&1 &
           pid=$!
           ok=0
           for i in $(seq 1 60); do          # 60 x 5s = 300s hard cap (covers onefile self-extract)
-            if [ -f bootok ]; then ok=1; break; fi
+            if [ -f "$PWD/bootok" ]; then ok=1; break; fi
             if ! kill -0 "$pid" 2>/dev/null; then break; fi   # process exited without writing a marker
             sleep 5
           done
