@@ -1,0 +1,108 @@
+name: Build engine app installer (Nuitka onefile, 3-OS)
+# t1787311662473 (g_eng_app "Nuitka installer" milestone, engine_standin 2026-08-22). FREE pool
+# (dmanobela-glitch) — the Bull4Life org pool saturates and cancels this build (see the cancelled
+# build-engine.yml runs on bull4life-build). Clones the PRIVATE engine READ-ONLY (ENGINE_TOKEN),
+# runs the proven build_engine_app.py per OS, then --verify-boot smoke + secret gate before the
+# compiled installer is published as release engine-app-vX.Y.Z. Never publishes readable source —
+# Nuitka compiles everything; scan_bundle_secrets is the belt-and-suspenders reveal-nothing gate.
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'app version (semver, e.g. 1.3.0) — stamped into the exe metadata'
+        required: true
+        default: '1.3.0'
+permissions:
+  contents: write          # publish artifacts as a Release (token-free public download)
+jobs:
+  build:
+    name: build-${{ matrix.arch }}
+    strategy:
+      fail-fast: false     # a Mac/Linux hiccup never blocks the Windows (WebView2) installer
+      matrix:
+        include:
+          - runner: windows-latest     # the milestone core: native WebView2 window (pywebview)
+            arch: windows-x64
+            out: Bull4LifeEngine-windows.exe
+          - runner: ubuntu-22.04       # browser-fallback build (no pywebview/GTK in CI)
+            arch: linux-x64
+            out: Bull4LifeEngine-linux
+          - runner: macos-latest       # native WKWebView .app bundle (--macos-create-app-bundle)
+            arch: macos-arm64
+            out: Bull4LifeEngine-macos.app
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash                    # Git Bash on windows-latest -> one set of steps works on all 3
+    steps:
+      - name: Clone private engine source (read-only token, never logged)
+        run: |
+          git clone --depth 1 "https://x-access-token:${{ secrets.ENGINE_TOKEN }}@github.com/Bull4Life/bull4life-engine.git" engine 2>/dev/null
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build deps (+ the native-window backend for THIS OS)
+        run: |
+          pip install "nuitka[onefile]" zstandard numpy pandas psutil cryptography certifi requests
+          case "${{ matrix.runner }}" in
+            windows-latest) pip install pywebview ;;                                       # WebView2 native window
+            macos-latest)   pip install pywebview pyobjc-framework-WebKit pyobjc-framework-Cocoa imageio ;; # WKWebView + .icns
+            ubuntu-22.04)   echo "linux: no pywebview — the app opens the dashboard in the browser (fallback)" ;;
+          esac
+      - name: Build the installer (Nuitka onefile via build_engine_app.py)
+        working-directory: engine
+        env:
+          B4L_APP_VERSION: ${{ inputs.app_version }}   # stamped into the exe metadata + in-app version
+        run: python build_engine_app.py
+      - name: Locate binary
+        working-directory: engine
+        run: |
+          set +o pipefail   # `shell: bash` enables pipefail; `grep … | head -n1` SIGPIPEs grep -> false failure
+          f=""
+          for c in dist/engine_app.exe dist/Bull4LifeEngine.exe dist/engine_app.bin dist/engine_app; do
+            if [ -e "$c" ]; then f="$c"; break; fi
+          done
+          if [ -z "$f" ] && [ -d dist/engine_app.app ]; then
+            f=$(find dist/engine_app.app -type f -perm -u+x | head -n1)
+          fi
+          if [ -z "$f" ]; then echo "no binary"; ls -la dist || true; exit 1; fi
+          echo "FOUND_BIN=$f" >> "$GITHUB_ENV"
+          echo "binary: $f ($(du -h "$f" | cut -f1))"
+      - name: Smoke test — installer must boot + import the full app chain (B4L_BOOTOK_MARKER)
+        working-directory: engine
+        run: |
+          rm -f bootok
+          echo "running --verify-boot (imports engine_web/credit_chain/b4l_chain/accounts/bot_*/fund + the frozen self-dispatch targets node/brain/chain) on ${{ matrix.arch }} …"
+          B4L_BOOTOK_MARKER=bootok timeout 300 "$FOUND_BIN" --verify-boot || true   # self-exits; 300s covers onefile self-extract
+          if [ ! -f bootok ]; then
+            echo "SMOKE FAILED: --verify-boot wrote no boot-ok marker -> the frozen app's import chain is broken."
+            echo "This build is NOT published."
+            exit 1
+          fi
+          echo "smoke OK: installer boots and the full app chain imports"
+      - name: "GATE — reveal nothing (scan_bundle_secrets: no keys/tokens/handle in the exe)"
+        working-directory: engine
+        run: |
+          python tools/scan_bundle_secrets.py "$FOUND_BIN"   # FAILS (exit 1) on any hit -> build not published
+      - name: Stage artifact for the release
+        run: |
+          cp -r "$FOUND_BIN" "${{ matrix.out }}"
+          chmod +x "${{ matrix.out }}" 2>/dev/null || true
+          echo "size: $(du -sh "${{ matrix.out }}" | cut -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.out }}
+          path: ${{ matrix.out }}
+          retention-days: 7
+      - name: Publish installer release (engine-app-v${{ inputs.app_version }})
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.out }}
+          tag_name: engine-app-v${{ inputs.app_version }}
+          name: "Bull4Life Engine installer v${{ inputs.app_version }}"
+          body: |
+            ${{ matrix.out }} — Nuitka onefile installer, compiled (no readable source).
+            Built from Bull4Life/bull4life-engine master, --verify-boot smoke + secret gate green.
+            Windows = native WebView2 window; macOS = WKWebView .app; Linux = browser-fallback.
+          fail_on_unmatched_files: false
