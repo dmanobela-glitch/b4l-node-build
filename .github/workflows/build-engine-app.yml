@@ -140,6 +140,17 @@ jobs:
           cp -r "$FOUND_BIN" "${{ matrix.out }}"
           chmod +x "${{ matrix.out }}" 2>/dev/null || true
           echo "size: $(du -sh "${{ matrix.out }}" | cut -f1)"
+          # macOS .app is a DIRECTORY; GitHub release assets must be files and
+          # softprops/action-gh-release drops directories (its paths() filter is
+          # statSync().isFile()) — with fail_on_unmatched_files:false the job would
+          # "succeed" with ZERO macos asset uploaded. Zip with ditto (preserves
+          # symlinks/permissions) so the release actually gets the macOS asset.
+          if [ -d "${{ matrix.out }}" ]; then
+            ditto -c -k --keepParent "${{ matrix.out }}" "${{ matrix.out }}.zip"
+            echo "RELEASE_ASSET=${{ matrix.out }}.zip" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_ASSET=${{ matrix.out }}" >> "$GITHUB_ENV"
+          fi
       - uses: actions/upload-artifact@v4
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         with:
@@ -150,7 +161,7 @@ jobs:
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.out }}
+          files: ${{ env.RELEASE_ASSET }}
           tag_name: engine-app-v${{ inputs.app_version }}
           name: "Bull4Life Engine installer v${{ inputs.app_version }}"
           body: |
