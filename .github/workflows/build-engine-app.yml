@@ -64,7 +64,12 @@ jobs:
             if [ -e "$c" ]; then f="$c"; break; fi
           done
           if [ -z "$f" ] && [ -d dist/engine_app.app ]; then
-            f=$(find dist/engine_app.app -type f -perm -u+x | head -n1)
+            # macOS .app bundle: the executable lives at the TOP level of Contents/MacOS. Nuitka marks
+            # package data (+ certifi/cacert.pem) executable too — never let the find walk into them.
+            f=$(find dist/engine_app.app/Contents/MacOS -maxdepth 1 -type f -perm -u+x | head -n1)
+          fi
+          if [ -z "$f" ] && [ -d dist/engine_app.app ]; then
+            f=$(find dist/engine_app.app -type f -perm -u+x | head -n1)   # last resort (pre-bundle tooling)
           fi
           if [ -z "$f" ]; then echo "no binary"; ls -la dist || true; exit 1; fi
           echo "FOUND_BIN=$f" >> "$GITHUB_ENV"
@@ -72,15 +77,28 @@ jobs:
       - name: Smoke test — installer must boot + import the full app chain (B4L_BOOTOK_MARKER)
         working-directory: engine
         run: |
-          rm -f bootok
+          # Portable across windows/mac/linux (GNU `timeout` does not exist on mac/windows-bash): run the
+          # binary in the background, poll for the marker, hard-cap at 300s, and CAPTURE its output so a
+          # real boot/import failure is visible in the log instead of being swallowed by `|| true`.
+          rm -f bootok verify_boot.log
           echo "running --verify-boot (imports engine_web/credit_chain/b4l_chain/accounts/bot_*/fund + the frozen self-dispatch targets node/brain/chain) on ${{ matrix.arch }} …"
-          B4L_BOOTOK_MARKER=bootok timeout 300 "$FOUND_BIN" --verify-boot || true   # self-exits; 300s covers onefile self-extract
-          if [ ! -f bootok ]; then
-            echo "SMOKE FAILED: --verify-boot wrote no boot-ok marker -> the frozen app's import chain is broken."
+          B4L_BOOTOK_MARKER=bootok "$FOUND_BIN" --verify-boot >verify_boot.log 2>&1 &
+          pid=$!
+          ok=0
+          for i in $(seq 1 60); do          # 60 x 5s = 300s hard cap (covers onefile self-extract)
+            if [ -f bootok ]; then ok=1; break; fi
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi   # process exited without writing a marker
+            sleep 5
+          done
+          kill "$pid" 2>/dev/null || true
+          if [ "$ok" != 1 ]; then
+            echo "SMOKE FAILED: --verify-boot wrote no boot-ok marker (last lines of verify_boot.log):"
+            tail -40 verify_boot.log 2>/dev/null || true
             echo "This build is NOT published."
             exit 1
           fi
           echo "smoke OK: installer boots and the full app chain imports"
+          rm -f verify_boot.log
       - name: "GATE — reveal nothing (scan_bundle_secrets: no keys/tokens/handle in the exe)"
         working-directory: engine
         run: |
