@@ -99,6 +99,11 @@ jobs:
           if [ -z "$f" ]; then echo "no binary"; ls -la dist || true; exit 1; fi
           echo "FOUND_BIN=$PWD/$f" >> "$GITHUB_ENV"
           echo "binary: $f ($(du -h "$f" | cut -f1))"
+          # macOS: FOUND_BIN is the executable INSIDE Contents/MacOS; the RELEASE must carry the whole
+          # .app bundle (zip), so also record the bundle DIRECTORY for the Stage step.
+          if [ -d dist/engine_app.app ]; then
+            echo "FOUND_BUNDLE=$PWD/dist/engine_app.app" >> "$GITHUB_ENV"
+          fi
       - name: Smoke test — installer must boot + import the full app chain (B4L_BOOTOK_MARKER)
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         working-directory: engine
@@ -133,7 +138,13 @@ jobs:
       - name: Stage artifact for the release
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         run: |
-          cp -r "$FOUND_BIN" "${{ matrix.out }}"
+          # macOS ships the .app BUNDLE (a directory): copy FOUND_BUNDLE so the ditto branch below
+          # fires and RELEASE_ASSET is the .app.zip. Windows/Linux copy the single binary file.
+          if [ -n "$FOUND_BUNDLE" ]; then
+            cp -r "$FOUND_BUNDLE" "${{ matrix.out }}"
+          else
+            cp -r "$FOUND_BIN" "${{ matrix.out }}"
+          fi
           chmod +x "${{ matrix.out }}" 2>/dev/null || true
           echo "size: $(du -sh "${{ matrix.out }}" | cut -f1)"
           # macOS .app is a DIRECTORY; GitHub release assets must be files and
