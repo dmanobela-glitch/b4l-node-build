@@ -27,7 +27,10 @@ permissions:
 jobs:
   build:
     name: build-${{ matrix.arch }}
-    if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
+    # NOTE (d03b71c2 fix, engine_standin 2026-08-22 02:00Z): the platform filter lives on the STEPS, not the
+    # job `if:` — GitHub does not expose the `matrix` context in a job-level `if` (422 "Unrecognized named-value:
+    # 'matrix'"; the d03b71c2 job-if made every dispatch/push parse-fail). Each step guards on the same
+    # condition, so an unselected platform runs an empty job (clone + every real step skipped, never publishes).
     strategy:
       fail-fast: false     # a Mac/Linux hiccup never blocks the Windows (WebView2) installer
       matrix:
@@ -50,13 +53,19 @@ jobs:
       run:
         shell: bash                    # Git Bash on windows-latest -> one set of steps works on all 3
     steps:
+      - name: Skip unselected platform (no-op, never publishes)
+        if: ${{ inputs.platform != 'all' && matrix.platform_key != inputs.platform }}
+        run: echo "platform=${{ inputs.platform }} -> ${{ matrix.platform_key }} not selected; job is a no-op"
       - name: Clone private engine source (read-only token, never logged)
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         run: |
           git clone --depth 1 "https://x-access-token:${{ secrets.ENGINE_TOKEN }}@github.com/Bull4Life/bull4life-engine.git" engine 2>/dev/null
       - uses: actions/setup-python@v5
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         with:
           python-version: '3.12'
       - name: Install build deps (+ the native-window backend for THIS OS)
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         run: |
           pip install "nuitka[onefile]" zstandard numpy pandas psutil cryptography certifi requests
           case "${{ matrix.runner }}" in
@@ -65,11 +74,13 @@ jobs:
             ubuntu-22.04)   echo "linux: no pywebview — the app opens the dashboard in the browser (fallback)" ;;
           esac
       - name: Build the installer (Nuitka onefile via build_engine_app.py)
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         working-directory: engine
         env:
           B4L_APP_VERSION: ${{ inputs.app_version }}   # stamped into the exe metadata + in-app version
         run: python build_engine_app.py
       - name: Locate binary
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         working-directory: engine
         run: |
           set +o pipefail   # `shell: bash` enables pipefail; `grep … | head -n1` SIGPIPEs grep -> false failure
@@ -89,6 +100,7 @@ jobs:
           echo "FOUND_BIN=$f" >> "$GITHUB_ENV"
           echo "binary: $f ($(du -h "$f" | cut -f1))"
       - name: Smoke test — installer must boot + import the full app chain (B4L_BOOTOK_MARKER)
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         working-directory: engine
         run: |
           # Portable across windows/mac/linux (GNU `timeout` does not exist on mac/windows-bash): run the
@@ -114,20 +126,24 @@ jobs:
           echo "smoke OK: installer boots and the full app chain imports"
           rm -f verify_boot.log
       - name: "GATE — reveal nothing (scan_bundle_secrets: no keys/tokens/handle in the exe)"
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         working-directory: engine
         run: |
           python tools/scan_bundle_secrets.py "$FOUND_BIN"   # FAILS (exit 1) on any hit -> build not published
       - name: Stage artifact for the release
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         run: |
           cp -r "$FOUND_BIN" "${{ matrix.out }}"
           chmod +x "${{ matrix.out }}" 2>/dev/null || true
           echo "size: $(du -sh "${{ matrix.out }}" | cut -f1)"
       - uses: actions/upload-artifact@v4
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         with:
           name: ${{ matrix.out }}
           path: ${{ matrix.out }}
           retention-days: 7
       - name: Publish installer release (engine-app-v${{ inputs.app_version }})
+        if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.out }}
