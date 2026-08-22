@@ -97,7 +97,7 @@ jobs:
             f=$(find dist/engine_app.app -type f -perm -u+x | head -n1)   # last resort (pre-bundle tooling)
           fi
           if [ -z "$f" ]; then echo "no binary"; ls -la dist || true; exit 1; fi
-          echo "FOUND_BIN=$f" >> "$GITHUB_ENV"
+          echo "FOUND_BIN=$PWD/$f" >> "$GITHUB_ENV"
           echo "binary: $f ($(du -h "$f" | cut -f1))"
       - name: Smoke test — installer must boot + import the full app chain (B4L_BOOTOK_MARKER)
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
@@ -106,17 +106,13 @@ jobs:
           # Portable across windows/mac/linux (GNU `timeout` does not exist on mac/windows-bash): run the
           # binary in the background, poll for the marker, hard-cap at 300s, and CAPTURE its output so a
           # real boot/import failure is visible in the log instead of being swallowed by `|| true`.
-          rm -f "$PWD/bootok" verify_boot.log
+          rm -f bootok verify_boot.log
           echo "running --verify-boot (imports engine_web/credit_chain/b4l_chain/accounts/bot_*/fund + the frozen self-dispatch targets node/brain/chain) on ${{ matrix.arch }} …"
-          # ABSOLUTE marker path: strategy_plan.py does os.chdir(ROOT) at module scope and _verify_boot
-          # imports it BEFORE writing the marker, so a RELATIVE marker (bootok) lands in the chdir'd ROOT
-          # (onefile temp extraction dir) and the smoke never sees it -> false SMOKE FAILED with an empty
-          # log (process exits 0, no output). The marker path must survive the chdir.
-          B4L_BOOTOK_MARKER="$PWD/bootok" "$FOUND_BIN" --verify-boot >verify_boot.log 2>&1 &
+          B4L_BOOTOK_MARKER=bootok "$FOUND_BIN" --verify-boot >verify_boot.log 2>&1 &
           pid=$!
           ok=0
           for i in $(seq 1 60); do          # 60 x 5s = 300s hard cap (covers onefile self-extract)
-            if [ -f "$PWD/bootok" ]; then ok=1; break; fi
+            if [ -f bootok ]; then ok=1; break; fi
             if ! kill -0 "$pid" 2>/dev/null; then break; fi   # process exited without writing a marker
             sleep 5
           done
@@ -136,34 +132,21 @@ jobs:
           python tools/scan_bundle_secrets.py "$FOUND_BIN"   # FAILS (exit 1) on any hit -> build not published
       - name: Stage artifact for the release
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
-        working-directory: engine
         run: |
           cp -r "$FOUND_BIN" "${{ matrix.out }}"
           chmod +x "${{ matrix.out }}" 2>/dev/null || true
           echo "size: $(du -sh "${{ matrix.out }}" | cut -f1)"
-          # macOS .app is a DIRECTORY; GitHub release assets must be files and
-          # softprops/action-gh-release drops directories (its paths() filter is
-          # statSync().isFile()) — with fail_on_unmatched_files:false the job would
-          # "succeed" with ZERO macos asset uploaded. Zip with ditto (preserves
-          # symlinks/permissions) so the release actually gets the macOS asset.
-          if [ -d "${{ matrix.out }}" ]; then
-            ditto -c -k --keepParent "${{ matrix.out }}" "${{ matrix.out }}.zip"
-            echo "RELEASE_ASSET=${{ matrix.out }}.zip" >> "$GITHUB_ENV"
-          else
-            echo "RELEASE_ASSET=${{ matrix.out }}" >> "$GITHUB_ENV"
-          fi
       - uses: actions/upload-artifact@v4
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         with:
           name: ${{ matrix.out }}
-          path: engine/${{ matrix.out }}
+          path: ${{ matrix.out }}
           retention-days: 7
       - name: Publish installer release (engine-app-v${{ inputs.app_version }})
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
-        working-directory: engine
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.RELEASE_ASSET }}
+          files: ${{ matrix.out }}
           tag_name: engine-app-v${{ inputs.app_version }}
           name: "Bull4Life Engine installer v${{ inputs.app_version }}"
           body: |
