@@ -136,6 +136,7 @@ jobs:
           python tools/scan_bundle_secrets.py "$FOUND_BIN"   # FAILS (exit 1) on any hit -> build not published
       - name: Stage artifact for the release
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
+        working-directory: engine
         run: |
           cp -r "$FOUND_BIN" "${{ matrix.out }}"
           chmod +x "${{ matrix.out }}" 2>/dev/null || true
@@ -155,10 +156,11 @@ jobs:
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         with:
           name: ${{ matrix.out }}
-          path: ${{ matrix.out }}
+          path: engine/${{ matrix.out }}
           retention-days: 7
       - name: Publish installer release (engine-app-v${{ inputs.app_version }})
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
+        working-directory: engine
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.RELEASE_ASSET }}
