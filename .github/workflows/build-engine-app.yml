@@ -59,7 +59,7 @@ jobs:
       - name: Clone private engine source (read-only token, never logged)
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         run: |
-          git clone --depth 1 "https://x-access-token:${{ secrets.ENGINE_TOKEN }}@github.com/Bull4Life/bull4life-engine.git" engine 2>/dev/null
+          git clone --depth 1 "https://x-access-token:${{ secrets.ENGINE_TOKEN }}@github.com/dmanobela-glitch/bull4life-engine.git" engine 2>/dev/null
       - uses: actions/setup-python@v5
         if: ${{ inputs.platform == 'all' || matrix.platform_key == inputs.platform }}
         with:
@@ -173,6 +173,6 @@ jobs:
           name: "Bull4Life Engine installer v${{ inputs.app_version }}"
           body: |
             ${{ matrix.out }} — Nuitka onefile installer, compiled (no readable source).
-            Built from Bull4Life/bull4life-engine master, --verify-boot smoke + secret gate green.
+            Built from dmanobela-glitch/bull4life-engine master, --verify-boot smoke + secret gate green.
             Windows = native WebView2 window; macOS = WKWebView .app; Linux = browser-fallback.
           fail_on_unmatched_files: false
